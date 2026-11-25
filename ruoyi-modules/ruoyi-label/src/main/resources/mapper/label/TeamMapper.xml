@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.TeamMapper">
+
+    <select id="selectTeams" resultType="org.dromara.label.vo.TeamVO">
+        SELECT team.id,
+               team.team_name AS teamName,
+               COALESCE(leader.nick_name, leader.user_name, '未分配') AS leaderName,
+               COUNT(DISTINCT tm.user_id) AS memberCount,
+               COUNT(DISTINCT task.id) AS runningTaskCount,
+               COALESCE(SUM(job.asset_count), 0) AS weeklyOutput,
+               COALESCE(ROUND(AVG(report.pass_rate)), 0) AS qualityRate,
+               team.status
+        FROM label_team team
+        LEFT JOIN sys_user leader ON leader.user_id = team.leader_id
+        LEFT JOIN label_team_member tm ON tm.team_id = team.id AND tm.deleted = 0
+        LEFT JOIN label_task task ON task.team_id = team.id AND task.deleted = 0 AND task.status &lt;&gt; 'completed'
+        LEFT JOIN label_job job ON job.task_id = task.id AND job.deleted = 0
+        LEFT JOIN label_qc_report report ON report.task_id = task.id AND report.deleted = 0
+        WHERE team.deleted = 0
+        GROUP BY team.id, team.team_name, leader.nick_name, leader.user_name, team.status
+        ORDER BY team.id
+    </select>
+
+    <select id="selectTeam" resultType="org.dromara.label.vo.TeamVO">
+        SELECT team.id,
+               team.team_name AS teamName,
+               COALESCE(leader.nick_name, leader.user_name, '未分配') AS leaderName,
+               team.status
+        FROM label_team team
+        LEFT JOIN sys_user leader ON leader.user_id = team.leader_id
+        WHERE team.deleted = 0 AND team.id = #{id}
+    </select>
+
+    <select id="selectTeamLeaderId" resultType="long">
+        SELECT leader_id FROM label_team WHERE deleted = 0 AND id = #{id}
+    </select>
+
+    <select id="countTeamBoundProjects" resultType="long">
+        SELECT COUNT(*) FROM (
+            SELECT pt.project_id
+            FROM label_project_team pt
+            JOIN label_project p ON p.id = pt.project_id AND p.deleted = 0
+            WHERE pt.deleted = 0 AND pt.team_id = #{teamId}
+            UNION
+            SELECT id AS project_id
+            FROM label_project
+            WHERE deleted = 0 AND team_id = #{teamId}
+        ) bound
+    </select>
+
+    <insert id="insertTeam" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_team (team_name, leader_id, status, created_by, updated_by)
+        VALUES (#{teamName}, #{leaderId}, #{status}, #{userId}, #{userId})
+    </insert>
+
+    <update id="updateTeam" parameterType="map">
+        UPDATE label_team
+        SET team_name = #{teamName}, leader_id = #{leaderId}, status = #{status},
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="softDeleteTeam">
+        UPDATE label_team
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <!-- ============ 团队成员 ============ -->
+
+    <select id="selectTeamMembers" resultType="org.dromara.label.vo.TeamMemberVO">
+        SELECT tm.id,
+               tm.team_id AS teamId,
+               u.user_id AS userId,
+               u.nick_name,
+               u.user_name,
+               tm.team_role AS teamRole
+        FROM label_team_member tm
+        JOIN sys_user u ON u.user_id = tm.user_id
+        WHERE tm.deleted = 0 AND tm.team_id = #{teamId}
+        ORDER BY tm.id
+    </select>
+
+    <delete id="deleteTeamMembersByTeam">
+        DELETE FROM label_team_member WHERE team_id = #{teamId}
+    </delete>
+
+    <insert id="insertTeamMember" parameterType="map">
+        INSERT INTO label_team_member (team_id, user_id, team_role, created_by, updated_by)
+        VALUES (#{teamId}, #{userId}, #{role}, #{actorId}, #{actorId})
+    </insert>
+
+    <!-- ============ 工作量 ============ -->
+
+    <select id="selectTeamWorkload" resultType="org.dromara.label.vo.TeamWorkloadVO">
+        SELECT u.nick_name AS name,
+               COALESCE(SUM(CASE WHEN j.assignee_id = u.user_id THEN j.asset_count ELSE 0 END), 0) AS total,
+               COALESCE(SUM(CASE WHEN j.assignee_id = u.user_id AND DATE(j.update_time) = CURRENT_DATE()
+                   THEN j.asset_count ELSE 0 END), 0) AS today,
+               COALESCE(SUM(CASE WHEN j.assignee_id = u.user_id AND YEARWEEK(j.update_time, 1) = YEARWEEK(CURRENT_DATE(), 1)
+                   THEN j.asset_count ELSE 0 END), 0) AS week,
+               COALESCE(SUM(CASE WHEN j.reviewer_id = u.user_id THEN j.asset_count ELSE 0 END), 0) AS review
+        FROM label_team_member tm
+        JOIN sys_user u ON u.user_id = tm.user_id
+        LEFT JOIN label_job j ON j.deleted = 0 AND (j.assignee_id = u.user_id OR j.reviewer_id = u.user_id)
+        WHERE tm.deleted = 0 AND tm.team_id = #{teamId}
+        GROUP BY u.user_id, u.nick_name
+        ORDER BY total DESC, review DESC
+    </select>
+</mapper>

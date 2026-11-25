@@ -1,0 +1,287 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.EntryNodeMapper">
+
+    <resultMap id="EntryNodeResult" type="org.dromara.label.entity.LabelEntryNode">
+        <id property="id" column="id"/>
+        <result property="entryId" column="entry_id"/>
+        <result property="taskId" column="task_id"/>
+        <result property="nodeKey" column="node_key"/>
+        <result property="nodeType" column="node_type"/>
+        <result property="status" column="status"/>
+        <result property="operatorId" column="operator_id"/>
+        <result property="prevStatus" column="prev_status"/>
+        <result property="skipBy" column="skip_by"/>
+        <result property="skipTime" column="skip_time"/>
+        <result property="abandonBy" column="abandon_by"/>
+        <result property="abandonTime" column="abandon_time"/>
+        <result property="claimTime" column="claim_time"/>
+        <result property="doneTime" column="done_time"/>
+        <result property="createdBy" column="created_by"/>
+        <result property="updatedBy" column="updated_by"/>
+        <result property="createTime" column="create_time"/>
+        <result property="updateTime" column="update_time"/>
+        <result property="deleted" column="deleted"/>
+    </resultMap>
+
+    <sql id="entryNodeColumns">
+        id, entry_id, task_id, node_key, node_type, status, operator_id, prev_status,
+        skip_by, skip_time, abandon_by, abandon_time, claim_time, done_time,
+        created_by, updated_by, create_time, update_time, deleted
+    </sql>
+
+    <select id="selectByEntryAndNode" resultMap="EntryNodeResult">
+        SELECT <include refid="entryNodeColumns"/>
+        FROM label_entry_node
+        WHERE deleted = 0 AND entry_id = #{entryId} AND node_key = #{nodeKey}
+        LIMIT 1
+    </select>
+
+    <!-- 按条目集合查全部节点记录（推导条目当前所处工作流节点用） -->
+    <select id="selectByEntryIds" resultMap="EntryNodeResult">
+        SELECT <include refid="entryNodeColumns"/>
+        FROM label_entry_node
+        WHERE deleted = 0
+          AND entry_id IN
+        <foreach collection="entryIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </select>
+
+    <insert id="insertIgnore">
+        INSERT IGNORE INTO label_entry_node (
+            entry_id, task_id, node_key, node_type, status,
+            created_by, updated_by, create_time, update_time, deleted
+        ) VALUES (
+            #{entryId}, #{taskId}, #{nodeKey}, #{nodeType}, #{status},
+            #{createdBy}, #{updatedBy}, NOW(), NOW(), 0
+        )
+    </insert>
+
+    <!--
+      按任务批量初始化节点池子记录：仅对「已提交可审核」条目建记录，
+      初始状态按条目审核状态推导（兼容审核工作台旧流程已领取/已审完的条目）：
+      - reviewing/re_reviewing → claimed（已被审核员领取，带出处理人）
+      - passed → done（该节点已审完）
+      - 其余（none）→ pending（池子）
+    -->
+    <insert id="batchInsertPendingByTask">
+        INSERT IGNORE INTO label_entry_node (
+            entry_id, task_id, node_key, node_type, operator_id, status,
+            claim_time, done_time,
+            created_by, updated_by, create_time, update_time, deleted
+        )
+        SELECT e.id, e.task_id, #{nodeKey}, #{nodeType},
+               CASE WHEN e.review_status IN ('reviewing', 're_reviewing') THEN e.reviewer_id ELSE NULL END,
+               CASE WHEN e.review_status IN ('reviewing', 're_reviewing') THEN 'claimed'
+                    WHEN e.review_status = 'passed' THEN 'done'
+                    ELSE 'pending' END,
+               CASE WHEN e.review_status IN ('reviewing', 're_reviewing') THEN e.update_time ELSE NULL END,
+               CASE WHEN e.review_status = 'passed' THEN e.review_time ELSE NULL END,
+               #{userId}, #{userId}, NOW(), NOW(), 0
+        FROM label_data_entry e
+        WHERE e.deleted = 0
+          AND e.label_status IN ('labeled', 'revised')
+          AND e.task_id = #{taskId}
+    </insert>
+
+    <!--
+      已提交条目中缺该节点记录的数量（initNodeForTask 守卫）：
+      走 uk_entry_node(entry_id, node_key) 索引反连接探测，为 0 时跳过批量 INSERT。
+    -->
+    <select id="countMissingNodeRecords" resultType="int">
+        SELECT COUNT(*)
+        FROM label_data_entry e
+        WHERE e.deleted = 0
+          AND e.label_status IN ('labeled', 'revised')
+          AND e.task_id = #{taskId}
+          AND NOT EXISTS (SELECT 1 FROM label_entry_node n
+                          WHERE n.deleted = 0 AND n.entry_id = e.id AND n.node_key = #{nodeKey})
+    </select>
+
+    <!--
+      领取节点：pending → claimed；
+      兼容从 skipped/abandoned 直接领取（审核工作台旧入口领取被跳过条目时回收节点记录）。
+    -->
+    <update id="claim">
+        UPDATE label_entry_node
+        SET status = 'claimed',
+            operator_id = #{operatorId},
+            claim_time = NOW(),
+            prev_status = NULL,
+            skip_by = NULL,
+            skip_time = NULL,
+            abandon_by = NULL,
+            abandon_time = NULL,
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND entry_id = #{entryId} AND node_key = #{nodeKey}
+          AND status IN ('pending', 'skipped', 'abandoned')
+    </update>
+
+    <update id="skip">
+        UPDATE label_entry_node
+        SET status = 'skipped',
+            prev_status = #{prevStatus},
+            skip_by = #{skipBy},
+            skip_time = NOW(),
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND entry_id = #{entryId} AND node_key = #{nodeKey}
+          AND status IN ('pending', 'claimed')
+    </update>
+
+    <update id="abandon">
+        UPDATE label_entry_node
+        SET status = 'abandoned',
+            prev_status = #{prevStatus},
+            abandon_by = #{abandonBy},
+            abandon_time = NOW(),
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND entry_id = #{entryId} AND node_key = #{nodeKey}
+          AND status IN ('pending', 'claimed')
+    </update>
+
+    <!-- 恢复节点：跳过/放弃回滚到 prev_status，清空跳过/放弃信息 -->
+    <update id="restore">
+        UPDATE label_entry_node
+        SET status = #{restoredStatus},
+            prev_status = NULL,
+            skip_by = NULL,
+            skip_time = NULL,
+            abandon_by = NULL,
+            abandon_time = NULL,
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND entry_id = #{entryId} AND node_key = #{nodeKey}
+          AND status IN ('skipped', 'abandoned')
+    </update>
+
+    <!-- 按条目完成其被领取的节点记录（不限节点，审核通过时使用） -->
+    <update id="markDoneClaimed">
+        UPDATE label_entry_node
+        SET status = 'done',
+            done_time = NOW(),
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND entry_id = #{entryId} AND status = 'claimed'
+    </update>
+
+    <!-- 按条目重置其被领取的节点记录回池子（审核驳回时使用） -->
+    <update id="resetPendingClaimed">
+        UPDATE label_entry_node
+        SET status = 'pending',
+            operator_id = NULL,
+            prev_status = NULL,
+            skip_by = NULL,
+            skip_time = NULL,
+            abandon_by = NULL,
+            abandon_time = NULL,
+            claim_time = NULL,
+            done_time = NULL,
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND entry_id = #{entryId} AND status = 'claimed'
+    </update>
+
+    <!-- 任务级清扫：某节点全部条目审完（工作流推进到下一节点/终点时兜底，兼容作业级旧流程） -->
+    <update id="markAllDoneByTaskNode">
+        UPDATE label_entry_node
+        SET status = 'done',
+            done_time = NOW(),
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE deleted = 0 AND task_id = #{taskId} AND node_key = #{nodeKey}
+          AND status IN ('pending', 'claimed')
+    </update>
+
+    <!--
+      任务级同步：条目退回修订阶段时，按条目审核状态重排全部审核节点记录——
+      - reviewing/re_reviewing：审核员仍持有的领取 → claimed（保留处理人）
+      - passed：本级已审完 → done
+      - 其余（none/rejected）：回池子 pending，修订完重新提交后重新领取
+    -->
+    <update id="syncTaskReviewNodes">
+        UPDATE label_entry_node n
+        JOIN label_data_entry e ON e.id = n.entry_id
+        SET n.status = CASE
+                WHEN e.review_status IN ('reviewing', 're_reviewing') THEN 'claimed'
+                WHEN e.review_status = 'passed' THEN 'done'
+                ELSE 'pending'
+            END,
+            n.operator_id = CASE
+                WHEN e.review_status IN ('reviewing', 're_reviewing') THEN e.reviewer_id
+                WHEN e.review_status = 'passed' THEN n.operator_id
+                ELSE NULL
+            END,
+            n.claim_time = CASE
+                WHEN e.review_status IN ('reviewing', 're_reviewing') THEN n.claim_time
+                ELSE NULL
+            END,
+            n.done_time = CASE WHEN e.review_status = 'passed' THEN e.review_time ELSE NULL END,
+            n.prev_status = NULL,
+            n.skip_by = NULL,
+            n.skip_time = NULL,
+            n.abandon_by = NULL,
+            n.abandon_time = NULL,
+            n.updated_by = #{updatedBy},
+            n.update_time = NOW()
+        WHERE n.deleted = 0 AND n.task_id = #{taskId} AND n.node_type = 'review'
+    </update>
+
+    <!--
+      同步单条 entry.latest_node_id：在该 entry 上 INSERT 一条 entry_node 后调用，
+      把 entry 冗余的 latest_node_id 指向其 task 下 MAX(n.id)，让总览 SELECT 直接主键 JOIN。
+      entry 可能在多个 task 下有记录，用 MAX(n.id) WHERE n.task_id = #{taskId} 与总览语义一致。
+    -->
+    <update id="updateEntryLatestNodeId">
+        UPDATE label_data_entry e
+        SET e.latest_node_id = (
+            SELECT MAX(n.id) FROM label_entry_node n
+            WHERE n.entry_id = e.id AND n.deleted = 0 AND n.task_id = #{taskId}
+        ),
+            e.updated_by = #{userId},
+            e.update_time = NOW()
+        WHERE e.id = #{entryId} AND e.deleted = 0
+    </update>
+
+    <!--
+      任务级同步：batchInsertPendingByTask 后调用，把该 task 下该 node_key
+      关联的全部 entry 的 latest_node_id 刷成 n.id。无 entry_node 记录的 entry
+      不受影响（JOIN 不命中），保持 NULL（总览 LEFT JOIN 时 COALESCE 兜底为 pending）。
+      仅在 batchInsertPendingByTask 真正执行（即 countMissingNodeRecords > 0）后调用，
+      守卫内已短路时本方法不会被调用。
+      防回退条件：仅当 n.id 比现有指针更新（或指针为 NULL）才刷新——切换回老节点视图触发
+      补记录时，老节点记录 id 小于已流转条目的指针，不回刷，保证 latest 始终指向最新流转。
+    -->
+    <update id="syncLatestNodeIdsByTaskNode">
+        UPDATE label_data_entry e
+        JOIN label_entry_node n ON n.entry_id = e.id
+        SET e.latest_node_id = n.id,
+            e.updated_by = #{userId},
+            e.update_time = NOW()
+        WHERE n.deleted = 0 AND n.task_id = #{taskId} AND n.node_key = #{nodeKey}
+          AND e.deleted = 0
+          AND e.task_id = #{taskId}
+          AND (e.latest_node_id IS NULL OR e.latest_node_id &lt; n.id)
+    </update>
+
+    <!--
+      批量同步 entry.latest_node_id（MAX 语义）：insertEntryNodeClaim 等批量 INSERT 后调用，
+      把列表内每个 entry 的指针刷成其 task 下 MAX(n.id)。首次插入（新行 id 最大）正确指向；
+      ON DUPLICATE KEY UPDATE 不换 id，重复调用幂等。
+    -->
+    <update id="updateEntryLatestNodeIds">
+        UPDATE label_data_entry e
+        SET e.latest_node_id = (
+            SELECT MAX(n.id) FROM label_entry_node n
+            WHERE n.entry_id = e.id AND n.deleted = 0 AND n.task_id = #{taskId}
+        ),
+            e.updated_by = #{userId},
+            e.update_time = NOW()
+        WHERE e.deleted = 0
+          AND e.id IN
+        <foreach collection="entryIds" item="entryId" open="(" separator="," close=")">#{entryId}</foreach>
+    </update>
+</mapper>

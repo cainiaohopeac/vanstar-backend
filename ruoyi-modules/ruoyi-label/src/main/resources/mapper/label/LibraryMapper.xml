@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.LibraryMapper">
+
+    <!-- ============================ 标签集 ============================ -->
+
+    <select id="selectSets" resultType="org.dromara.label.vo.LibrarySetVO">
+        SELECT s.id,
+               s.scene,
+               s.name,
+               s.description,
+               s.sort_order AS sortOrder,
+               (SELECT COUNT(*) FROM label_library_label l
+                WHERE l.set_id = s.id AND l.deleted = 0) AS labelCount
+        FROM label_library_set s
+        WHERE s.deleted = 0
+        <if test="scene != null and scene != ''">
+            AND s.scene = #{scene}
+        </if>
+        ORDER BY s.sort_order, s.id
+    </select>
+
+    <select id="selectSetById" resultType="org.dromara.label.vo.LibrarySetVO">
+        SELECT id, scene, name, description, sort_order AS sortOrder,
+               (SELECT COUNT(*) FROM label_library_label l
+                WHERE l.set_id = s.id AND l.deleted = 0) AS labelCount
+        FROM label_library_set s
+        WHERE s.id = #{id} AND s.deleted = 0
+    </select>
+
+    <insert id="insertSet" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_library_set (scene, name, description, sort_order, created_by, updated_by)
+        VALUES (#{scene}, #{name}, #{description}, #{sortOrder}, #{userId}, #{userId})
+    </insert>
+
+    <update id="updateSet">
+        UPDATE label_library_set
+        SET name = #{name},
+            description = #{description},
+            sort_order = COALESCE(#{sortOrder}, sort_order),
+            updated_by = #{userId}
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- 集删除连带集内标签：软删语义，避免孤儿标签占着 labelCount 统计 -->
+    <update id="deleteSet">
+        UPDATE label_library_set SET deleted = 1, updated_by = #{userId}
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- ============================ 标签 ============================ -->
+
+    <sql id="labelSelect">
+        SELECT l.id,
+               l.set_id AS setId,
+               s.name AS setName,
+               s.scene,
+               l.parent_id AS parentId,
+               l.label_name AS labelName,
+               l.color,
+               l.tool_type AS toolType,
+               l.node_type AS nodeType,
+               l.default_size_l AS defaultSizeL,
+               l.default_size_w AS defaultSizeW,
+               l.default_size_h AS defaultSizeH,
+               l.is_rigid AS isRigid,
+               l.min_inside_points AS minInsidePoints,
+               JSON_UNQUOTE(JSON_EXTRACT(l.keypoint_template_json, '$')) AS keypointTemplate,
+               l.sort_order AS sortOrder
+        FROM label_library_label l
+        JOIN label_library_set s ON s.id = l.set_id AND s.deleted = 0
+        WHERE l.deleted = 0
+    </sql>
+
+    <select id="selectLabels" resultType="org.dromara.label.vo.LibraryLabelVO">
+        <include refid="labelSelect"/>
+        AND l.set_id = #{setId}
+        ORDER BY l.sort_order, l.id
+    </select>
+
+    <select id="selectLabelsByIds" resultType="org.dromara.label.vo.LibraryLabelVO">
+        <include refid="labelSelect"/>
+        AND l.id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">#{id}</foreach>
+        ORDER BY s.scene, l.set_id, l.sort_order, l.id
+    </select>
+
+    <insert id="insertLabel" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_library_label (
+            set_id, label_name, color, tool_type, node_type,
+            default_size_l, default_size_w, default_size_h, is_rigid, min_inside_points,
+            keypoint_template_json, sort_order, created_by, updated_by
+        ) VALUES (
+            #{setId}, #{labelName}, #{color}, #{toolType}, #{nodeType},
+            #{defaultSizeL}, #{defaultSizeW}, #{defaultSizeH}, #{isRigid}, #{minInsidePoints},
+            #{keypointTemplateJson}, #{sortOrder}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <!-- 关键点模板传 null 时 COALESCE 保留库中原值（与 label_class 更新同款语义） -->
+    <update id="updateLabel">
+        UPDATE label_library_label
+        SET label_name = #{labelName},
+            color = #{color},
+            tool_type = #{toolType},
+            node_type = #{nodeType},
+            default_size_l = #{defaultSizeL},
+            default_size_w = #{defaultSizeW},
+            default_size_h = #{defaultSizeH},
+            is_rigid = COALESCE(#{isRigid}, is_rigid),
+            min_inside_points = #{minInsidePoints},
+            keypoint_template_json = COALESCE(#{keypointTemplateJson}, keypoint_template_json),
+            sort_order = COALESCE(#{sortOrder}, sort_order),
+            updated_by = #{userId}
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <update id="deleteLabel">
+        UPDATE label_library_label SET deleted = 1, updated_by = #{userId}
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- ============================ 项目引入（复制语义） ============================ -->
+
+    <!-- 整集复制：列与 label_class 一一对应，NULL/默认值与 ProjectServiceImpl.createClass 落库口径一致
+         （is_rigid 空落 0；模板/尺寸原样带过）。单条 INSERT ... SELECT，几十个标签一次落库 -->
+    <insert id="copyVisualSetToClassSet">
+        INSERT INTO label_class (
+            class_set_id, label_name, color, tool_type,
+            default_size_l, default_size_w, default_size_h, is_rigid, min_inside_points,
+            keypoint_template_json, sort_order, status, created_by, updated_by
+        )
+        SELECT #{classSetId}, l.label_name, l.color, l.tool_type,
+               l.default_size_l, l.default_size_w, l.default_size_h, COALESCE(l.is_rigid, 0), l.min_inside_points,
+               l.keypoint_template_json, l.sort_order, 'active', #{userId}, #{userId}
+        FROM label_library_label l
+        JOIN label_library_set s ON s.id = l.set_id AND s.deleted = 0
+        WHERE l.deleted = 0 AND l.set_id = #{setId}
+        ORDER BY l.sort_order, l.id
+    </insert>
+
+    <!-- 任选复制：勾选的库标签可跨集（ids 由服务层校验非空） -->
+    <insert id="copyVisualLabelsToClassSet">
+        INSERT INTO label_class (
+            class_set_id, label_name, color, tool_type,
+            default_size_l, default_size_w, default_size_h, is_rigid, min_inside_points,
+            keypoint_template_json, sort_order, status, created_by, updated_by
+        )
+        SELECT #{classSetId}, l.label_name, l.color, l.tool_type,
+               l.default_size_l, l.default_size_w, l.default_size_h, COALESCE(l.is_rigid, 0), l.min_inside_points,
+               l.keypoint_template_json, l.sort_order, 'active', #{userId}, #{userId}
+        FROM label_library_label l
+        WHERE l.deleted = 0 AND l.id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">#{id}</foreach>
+        ORDER BY l.sort_order, l.id
+    </insert>
+
+    <!-- 文本层级回填：先整批插为顶层，再按「库标签id → 项目标签id」映射补 parent_id -->
+    <update id="updateTextClassParent">
+        UPDATE label_text_class SET parent_id = #{parentId}, updated_by = #{userId}
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+</mapper>

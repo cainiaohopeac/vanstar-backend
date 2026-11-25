@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.PreAnnotationMapper">
+
+    <!-- ============ 取数 ============ -->
+
+    <select id="selectAssetsByUpload" resultType="org.dromara.label.vo.PreAnnotationAssetVO">
+        SELECT a.id AS assetId,
+               a.project_id AS projectId,
+               a.batch_id AS batchId,
+               a.upload_id AS uploadId,
+               a.entry_id AS entryId,
+               a.file_name AS fileName,
+               a.media_type AS mediaType,
+               a.file_url AS fileUrl,
+               a.width AS width,
+               a.height AS height
+        FROM label_asset a
+        WHERE a.deleted = 0 AND a.upload_id = #{uploadId}
+        ORDER BY a.id
+    </select>
+
+    <select id="selectAsset" resultType="org.dromara.label.vo.PreAnnotationAssetVO">
+        SELECT a.id AS assetId,
+               a.project_id AS projectId,
+               a.batch_id AS batchId,
+               a.upload_id AS uploadId,
+               a.entry_id AS entryId,
+               a.file_name AS fileName,
+               a.media_type AS mediaType,
+               a.file_url AS fileUrl,
+               a.width AS width,
+               a.height AS height
+        FROM label_asset a
+        WHERE a.deleted = 0 AND a.id = #{assetId}
+    </select>
+
+    <select id="selectPreAnnotation" resultType="org.dromara.label.vo.PreAnnotationVO">
+        SELECT p.id AS preAnnotationId,
+               p.asset_id AS assetId,
+               p.source AS source,
+               p.source_file AS sourceFile,
+               p.sample_token AS sampleToken,
+               p.sensor_channel AS sensorChannel,
+               p.box_count AS boxCount,
+               p.status AS status,
+               p.create_time AS createTime
+        FROM label_pre_annotation p
+        WHERE p.deleted = 0 AND p.asset_id = #{assetId}
+        ORDER BY p.id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectPreAnnotationObjects" resultType="org.dromara.label.vo.PreAnnotationObjectVO">
+        SELECT o.object_key AS objectKey,
+               o.object_type AS objectType,
+               o.class_id AS classId,
+               c.label_name AS className,
+               c.color AS color,
+               o.class_name AS sourceClassName,
+               JSON_UNQUOTE(JSON_EXTRACT(o.geometry_json, '$')) AS geometryJson,
+               JSON_UNQUOTE(JSON_EXTRACT(o.attr_json, '$')) AS attrJson,
+               o.visibility AS visibility,
+               o.track_token AS trackToken
+        FROM label_pre_annotation p
+        JOIN label_pre_annotation_object o ON o.pre_annotation_id = p.id AND o.deleted = 0
+        LEFT JOIN label_class c ON c.id = o.class_id
+        WHERE p.deleted = 0 AND p.asset_id = #{assetId}
+        ORDER BY o.id
+    </select>
+
+    <select id="selectProjectClasses" resultType="org.dromara.label.vo.WorkClassVO">
+        SELECT c.id AS classId, c.label_name AS className, c.color AS color,
+               c.tool_type AS toolType
+        FROM label_class_set cs
+        JOIN label_class c ON c.class_set_id = cs.id AND c.deleted = 0
+        WHERE cs.project_id = #{projectId} AND cs.deleted = 0
+        ORDER BY c.sort_order, c.id
+    </select>
+
+    <!--
+      自动补建标签用：label_class 不直接挂 project，而是挂在 class_set 下，
+      所以补标签前必须先定位到项目的标签集（项目可能还没有，由上层兜底创建）。
+    -->
+    <select id="selectClassSetId" resultType="java.lang.Long">
+        SELECT id FROM label_class_set
+        WHERE project_id = #{projectId} AND deleted = 0
+        ORDER BY id
+        LIMIT 1
+    </select>
+
+    <!-- 新增标签的排序号：现有建标签流程不自动算序号，这里取 max+1 排到最后 -->
+    <select id="selectMaxClassSortOrder" resultType="java.lang.Integer">
+        SELECT IFNULL(MAX(sort_order), 0)
+        FROM label_class
+        WHERE class_set_id = #{classSetId} AND deleted = 0
+    </select>
+
+    <!--
+      补齐标签缺失的标注工具：只填 tool_type 为空的记录，已有值的一律不动。
+      历史自动补建的标签没写工具类型（NULL），标注页因此不知道该用什么工具画。
+    -->
+    <update id="updateClassToolType">
+        UPDATE label_class
+        SET tool_type = #{toolType},
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{classId} AND deleted = 0
+          AND (tool_type IS NULL OR tool_type = '')
+    </update>
+
+    <!-- ============ 写入 ============ -->
+
+    <insert id="insertPreAnnotation" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_pre_annotation (
+            project_id, batch_id, upload_id, entry_id, asset_id, source, source_file,
+            sample_token, sensor_channel, box_count, status, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadId}, #{entryId}, #{assetId}, #{source}, #{sourceFile},
+            #{sampleToken}, #{sensorChannel}, #{boxCount}, #{status}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <insert id="insertPreAnnotationObject" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_pre_annotation_object (
+            pre_annotation_id, asset_id, object_key, object_type, class_id, class_name,
+            geometry_json, attr_json, track_token, visibility, created_by, updated_by
+        ) VALUES (
+            #{preAnnotationId}, #{assetId}, #{objectKey}, #{objectType}, #{classId}, #{className},
+            #{geometryJson}, #{attrJson}, #{trackToken}, #{visibility}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="softDeletePreAnnotationObjects">
+        UPDATE label_pre_annotation_object o
+        JOIN label_pre_annotation p ON p.id = o.pre_annotation_id
+        SET o.deleted = 1, o.updated_by = #{userId}, o.update_time = NOW()
+        WHERE o.deleted = 0 AND p.asset_id = #{assetId}
+    </update>
+
+    <update id="softDeletePreAnnotation">
+        UPDATE label_pre_annotation
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND asset_id = #{assetId}
+    </update>
+</mapper>

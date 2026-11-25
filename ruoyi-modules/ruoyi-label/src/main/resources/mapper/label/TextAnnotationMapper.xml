@@ -1,0 +1,179 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.TextAnnotationMapper">
+
+    <!-- ============ 标注存档 ============ -->
+
+    <select id="selectAnnotation" resultType="org.dromara.label.entity.LabelAnnotation">
+        SELECT id, job_id AS jobId, asset_id AS assetId, annotator_id AS annotatorId,
+               status, annotation_json AS annotationJson, deleted
+        FROM label_annotation
+        WHERE job_id = #{jobId} AND asset_id = #{assetId} AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <insert id="insertAnnotation" parameterType="org.dromara.label.entity.LabelAnnotation"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_annotation (
+            job_id, asset_id, annotator_id, version, status, annotation_json, created_by, updated_by
+        ) VALUES (
+            #{jobId}, #{assetId}, #{annotatorId}, 1, #{status}, #{annotationJson},
+            #{createBy}, #{updateBy}
+        )
+    </insert>
+
+    <update id="updateAnnotation" parameterType="org.dromara.label.entity.LabelAnnotation">
+        UPDATE label_annotation
+        SET status = #{status},
+            annotation_json = #{annotationJson},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- ============ 资产（正文与句边界） ============ -->
+
+    <select id="selectAsset" resultType="org.dromara.label.entity.LabelAsset">
+        SELECT id, project_id AS projectId, batch_id AS batchId, upload_id AS uploadId,
+               entry_id AS entryId, media_type AS mediaType, file_name AS fileName,
+               file_url AS fileUrl, file_size AS fileSize, parse_status AS parseStatus,
+               meta_json AS metaJson
+        FROM label_asset
+        WHERE id = #{assetId} AND deleted = 0
+    </select>
+
+    <!-- 导入解析完成后回写：句边界、字数、解析状态 -->
+    <update id="updateAssetMeta" parameterType="org.dromara.label.entity.LabelAsset">
+        UPDATE label_asset
+        SET meta_json = #{metaJson},
+            parse_status = #{parseStatus},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- ============ 实体标注 ============ -->
+
+    <!-- 直接返回 VO：联表带出标签名称与颜色，前端渲染高亮不必再按 classId 二次查询 -->
+    <select id="selectEntities" resultType="org.dromara.label.vo.TextEntityVO">
+        SELECT e.id, e.annotation_id AS annotationId, e.entity_key AS entityKey, e.class_id AS classId,
+               e.start_offset AS startOffset, e.end_offset AS endOffset, e.entity_text AS entityText,
+               e.sentence_index AS sentenceIndex, c.label_name AS className, c.color AS color
+        FROM label_text_entity e
+        LEFT JOIN label_text_class c ON c.id = e.class_id
+        WHERE e.annotation_id = #{annotationId} AND e.deleted = 0
+        ORDER BY e.start_offset, e.id
+    </select>
+
+    <!-- 批量版：一条 INSERT 带多行 VALUES，入参是 LabelTextEntity 实体。
+         一篇文本的实体通常在几十到几百条，全量重建时逐条插入会退化成上百次往返。 -->
+    <insert id="insertEntityRows" parameterType="java.util.List">
+        INSERT INTO label_text_entity (
+            annotation_id, entity_key, class_id, start_offset, end_offset,
+            entity_text, sentence_index, created_by, updated_by
+        ) VALUES
+        <foreach collection="list" item="p" separator=",">
+            (#{p.annotationId}, #{p.entityKey}, #{p.classId}, #{p.startOffset}, #{p.endOffset},
+            #{p.entityText}, #{p.sentenceIndex}, #{p.createBy}, #{p.updateBy})
+        </foreach>
+    </insert>
+
+    <update id="softDeleteEntities">
+        UPDATE label_text_entity
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE annotation_id = #{annotationId} AND deleted = 0
+    </update>
+
+    <!-- ============ 情感分类 ============ -->
+
+    <select id="selectSentiments" resultType="org.dromara.label.vo.TextSentimentVO">
+        SELECT s.id, s.annotation_id AS annotationId, s.level_type AS levelType,
+               s.sentence_index AS sentenceIndex, s.class_id AS classId, s.remark,
+               c.label_name AS className, c.color AS color
+        FROM label_text_sentiment s
+        LEFT JOIN label_text_class c ON c.id = s.class_id
+        WHERE s.annotation_id = #{annotationId} AND s.deleted = 0
+        ORDER BY s.level_type, s.sentence_index
+    </select>
+
+    <insert id="insertSentimentRows" parameterType="java.util.List">
+        INSERT INTO label_text_sentiment (
+            annotation_id, level_type, sentence_index, class_id, remark, created_by, updated_by
+        ) VALUES
+        <foreach collection="list" item="p" separator=",">
+            (#{p.annotationId}, #{p.levelType}, #{p.sentenceIndex}, #{p.classId}, #{p.remark},
+            #{p.createBy}, #{p.updateBy})
+        </foreach>
+    </insert>
+
+    <update id="softDeleteSentiments">
+        UPDATE label_text_sentiment
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE annotation_id = #{annotationId} AND deleted = 0
+    </update>
+
+    <!-- ============ 状态推进（提交审核） ============ -->
+
+    <select id="selectEntryIdByAssetId" resultType="long">
+        SELECT entry_id FROM label_asset WHERE id = #{assetId} AND deleted = 0
+    </select>
+
+    <select id="selectEntryLabelStatus" resultType="string">
+        SELECT label_status FROM label_data_entry WHERE id = #{entryId} AND deleted = 0
+    </select>
+
+    <!-- 提交后置为已标注/已修订，并重置审核状态为未审核 -->
+    <update id="updateAssetSubmitStatus" parameterType="org.dromara.label.entity.LabelAsset">
+        UPDATE label_asset
+        SET label_status = CASE
+                WHEN label_status IN ('unrevised', 'revising', 'revised') THEN 'revised'
+                ELSE 'labeled' END,
+            review_status = 'none',
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <update id="updateEntryLabelStatus" parameterType="org.dromara.label.entity.LabelDataEntry">
+        UPDATE label_data_entry
+        SET label_status = #{labelStatus},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- 作业进度以条目为单位聚合：作业内条目全部提交后才进入「待审核」 -->
+    <select id="selectJobEntryProgress" resultType="org.dromara.label.vo.JobEntryProgressVO">
+        SELECT COUNT(DISTINCT a.entry_id) AS total,
+               COUNT(DISTINCT CASE
+                   WHEN IFNULL(e.label_status, a.label_status)
+                        IN ('labeled', 'revised', 'skipped', 'abandoned')
+                   THEN a.entry_id END) AS done
+        FROM label_job_asset ja
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+        LEFT JOIN label_data_entry e ON e.id = a.entry_id AND e.deleted = 0
+        WHERE ja.deleted = 0 AND ja.job_id = #{jobId}
+    </select>
+
+    <!-- 作业内的文本条目：只取 media_type=text 的资产，避免误带出同作业的图片/点云 -->
+    <select id="selectJobTextAssets" resultType="org.dromara.label.vo.TextAssetVO">
+        SELECT a.id AS assetId, a.entry_id AS entryId, a.file_name AS fileName,
+               e.entry_name AS entryName,
+               IFNULL(e.label_status, a.label_status) AS labelStatus
+        FROM label_job_asset ja
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0 AND a.media_type = 'text'
+        LEFT JOIN label_data_entry e ON e.id = a.entry_id AND e.deleted = 0
+        WHERE ja.deleted = 0 AND ja.job_id = #{jobId}
+        ORDER BY a.id
+    </select>
+
+    <update id="updateJobProgress" parameterType="org.dromara.label.entity.LabelJob">
+        UPDATE label_job
+        SET status = #{status},
+            progress = #{progress},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+</mapper>

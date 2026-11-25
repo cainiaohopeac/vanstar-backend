@@ -1,0 +1,8 @@
+# 保证部署脚本在任何系统上检出的行尾一致为 LF
+# Windows 下 core.autocrlf=true 会把 .sh 转成 CRLF, 在 Linux/WSL 容器中会报 "$'\r': command not found";
+# 已注意到 Windows Git Bash 能容忍 CRLF, 但服务器(容器)与 WSL/macOS 不能。
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.conf text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

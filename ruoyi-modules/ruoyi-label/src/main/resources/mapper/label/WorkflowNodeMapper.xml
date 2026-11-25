@@ -1,0 +1,184 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.WorkflowNodeMapper">
+
+    <!--
+      任务条目范围（条目 = 数据集合包 label_data_entry）：
+      task_id 是条目归属任务的唯一依据，由 TaskMapper.bindEntriesToTask /
+      unbindEntriesFromTask 在批次下发、移出时与 label_task_batch 同步维护。
+      要求外层传入 taskId 参数。
+    -->
+    <sql id="entryScope">
+        e.deleted = 0
+        AND e.task_id = #{taskId}
+    </sql>
+
+
+    <select id="countProject" resultType="int">
+        SELECT COUNT(*) FROM label_project WHERE id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="selectNodes" resultType="org.dromara.label.entity.LabelWorkflowNode">
+        SELECT n.id            AS id,
+               n.project_id     AS projectId,
+               n.node_key       AS nodeKey,
+               n.node_name      AS nodeName,
+               n.node_type      AS nodeType,
+               n.sort_order     AS sortOrder,
+               n.remark         AS remark,
+               n.comment_types  AS commentTypes,
+               n.create_time    AS createTime,
+               n.update_time    AS updateTime,
+               n.created_by     AS createdBy,
+               n.updated_by     AS updatedBy,
+               n.deleted        AS deleted
+        FROM label_workflow_node n
+        WHERE n.project_id = #{projectId} AND n.deleted = 0
+        ORDER BY n.sort_order, n.id
+    </select>
+
+    <select id="countNodes" resultType="int">
+        SELECT COUNT(*) FROM label_workflow_node
+        WHERE project_id = #{projectId} AND deleted = 0
+    </select>
+
+    <insert id="insertNode" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO label_workflow_node
+            (project_id, node_key, node_name, node_type, sort_order, remark, comment_types,
+             create_time, update_time, created_by, updated_by, deleted)
+        VALUES
+            (#{projectId}, #{nodeKey}, #{nodeName}, #{nodeType}, #{sortOrder}, #{remark}, #{commentTypes},
+             NOW(), NOW(), #{createdBy}, #{updatedBy}, 0)
+        ON DUPLICATE KEY UPDATE
+            node_name = VALUES(node_name),
+            node_type = VALUES(node_type),
+            sort_order = VALUES(sort_order),
+            remark = VALUES(remark),
+            comment_types = VALUES(comment_types),
+            updated_by = VALUES(updated_by),
+            update_time = NOW(),
+            deleted = 0
+    </insert>
+
+    <update id="updateNode">
+        UPDATE label_workflow_node
+        SET node_name = #{nodeName},
+            node_type = #{nodeType},
+            sort_order = #{sortOrder},
+            remark = #{remark},
+            comment_types = #{commentTypes},
+            updated_by = #{updatedBy},
+            update_time = NOW()
+        WHERE project_id = #{projectId} AND node_key = #{nodeKey} AND deleted = 0
+    </update>
+
+    <update id="softDeleteNodesExcept">
+        UPDATE label_workflow_node
+        SET deleted = 1, updated_by = #{operator}, update_time = NOW()
+        WHERE project_id = #{projectId} AND deleted = 0
+        <if test="keepKeys != null and keepKeys.size() > 0">
+            AND node_key NOT IN
+            <foreach collection="keepKeys" item="key" open="(" separator="," close=")">
+                #{key}
+            </foreach>
+        </if>
+        <if test="keepKeys == null or keepKeys.size() == 0">
+            AND 1 = 0
+        </if>
+    </update>
+
+
+    <select id="selectTaskProjectId" resultType="long">
+        SELECT project_id FROM label_task WHERE id = #{taskId} AND deleted = 0
+    </select>
+
+    <select id="selectTaskCurrentNode" resultType="string">
+        SELECT current_node_key FROM label_task WHERE id = #{taskId} AND deleted = 0
+    </select>
+
+    <select id="selectTaskStatus" resultType="string">
+        SELECT status FROM label_task WHERE id = #{taskId} AND deleted = 0
+    </select>
+
+    <select id="selectTaskName" resultType="string">
+        SELECT task_name FROM label_task WHERE id = #{taskId} AND deleted = 0
+    </select>
+
+    <!-- 全部审核节点通过 = 任务完成（与任务状态机最终一致） -->
+    <update id="updateTaskStatusCompleted">
+        UPDATE label_task
+        SET status = 'completed',
+            updated_by = #{operator},
+            update_time = NOW()
+        WHERE id = #{taskId} AND deleted = 0 AND status &lt;&gt; 'completed'
+    </update>
+
+    <!-- 任务完成时同步完成数：按条目审核通过数覆盖（封顶 asset_count），
+         覆盖式更新天然幂等，不会与作业级验收的累加式更新重复计数 -->
+    <update id="updateTaskCompletedCount">
+        UPDATE label_task
+        SET completed_count = LEAST(asset_count, #{completedCount}),
+            updated_by = #{operator},
+            update_time = NOW()
+        WHERE id = #{taskId} AND deleted = 0
+    </update>
+
+    <update id="updateTaskCurrentNode">
+        UPDATE label_task
+        SET current_node_key = #{nodeKey},
+            updated_by = #{operator},
+            update_time = NOW()
+        WHERE id = #{taskId} AND deleted = 0 AND IFNULL(current_node_key, '') &lt;&gt; #{nodeKey}
+    </update>
+
+
+    <select id="selectEntryFlowStats" resultType="map">
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN e.label_status IN ('pending', 'labeling', 'revising', 'skipped', 'abandoned')
+                        THEN 1 ELSE 0 END) AS workingCount,
+               SUM(CASE WHEN e.label_status = 'unrevised' THEN 1 ELSE 0 END) AS rejectedCount,
+               SUM(CASE WHEN e.label_status IN ('labeled', 'revised') THEN 1 ELSE 0 END) AS labeledCount,
+               SUM(CASE WHEN e.label_status IN ('labeled', 'revised') AND e.review_status = 'passed'
+                        THEN 1 ELSE 0 END) AS passedCount,
+               SUM(CASE WHEN e.label_status IN ('labeled', 'revised')
+                         AND IFNULL(e.review_status, 'none') &lt;&gt; 'passed'
+                        THEN 1 ELSE 0 END) AS waitingReviewCount
+        FROM label_data_entry e
+        WHERE <include refid="entryScope"/>
+    </select>
+
+    <!-- 逐级审核：进入下一级审核节点前，把本级已通过的条目重置为「未审核」等待重新领取 -->
+    <update id="resetEntryReviewForNextNode">
+        UPDATE label_data_entry e
+        SET e.review_status = 'none',
+            e.reviewer_id = NULL,
+            e.review_time = NULL,
+            e.updated_by = #{operator},
+            e.update_time = NOW()
+        WHERE <include refid="entryScope"/>
+          AND e.label_status IN ('labeled', 'revised')
+          AND e.review_status = 'passed'
+    </update>
+
+    <update id="syncAssetsReviewForNextNode">
+        UPDATE label_asset a
+        JOIN label_data_entry e ON e.id = a.entry_id AND e.deleted = 0
+        SET a.review_status = 'none',
+            a.reviewer_id = NULL,
+            a.review_time = NULL,
+            a.update_time = NOW()
+        WHERE a.deleted = 0
+          AND e.label_status IN ('labeled', 'revised')
+          AND e.review_status = 'none'
+          AND <include refid="entryScope"/>
+    </update>
+
+    <update id="completeJobsByTask">
+        UPDATE label_job
+        SET status = 'completed',
+            updated_by = #{operator},
+            update_time = NOW()
+        WHERE task_id = #{taskId} AND deleted = 0 AND status &lt;&gt; 'completed'
+    </update>
+</mapper>

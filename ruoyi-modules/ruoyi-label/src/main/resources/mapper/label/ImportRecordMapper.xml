@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.ImportRecordMapper">
+
+    <insert id="insert" parameterType="org.dromara.label.entity.ImportRecord" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO import_record (user_id, project_id, batch_id, file_name, file_size, object_name, bucket_name, upload_id, chunk_size,
+                                   total_chunks, uploaded_chunks, uploaded_bytes, status, create_time, update_time)
+        VALUES (#{userId}, #{projectId}, #{batchId}, #{fileName}, #{fileSize}, #{objectName}, #{bucketName}, #{uploadId}, #{chunkSize},
+                #{totalChunks}, 0, 0, #{status}, NOW(), NOW())
+    </insert>
+
+    <select id="selectById" resultType="org.dromara.label.entity.ImportRecord">
+        SELECT * FROM import_record WHERE id = #{id}
+    </select>
+
+    <select id="selectByIdAndUserId" resultType="org.dromara.label.entity.ImportRecord">
+        SELECT * FROM import_record WHERE id = #{id} AND user_id = #{userId}
+    </select>
+
+    <select id="selectByUserId" resultType="org.dromara.label.entity.ImportRecord">
+        SELECT * FROM import_record
+        WHERE user_id = #{userId}
+        <if test="projectId != null">
+            AND project_id = #{projectId}
+        </if>
+        <if test="status != null">
+            AND status = #{status}
+        </if>
+        ORDER BY create_time DESC, id DESC
+        LIMIT #{offset}, #{limit}
+    </select>
+
+    <select id="countByUserId" resultType="long">
+        SELECT COUNT(*) FROM import_record
+        WHERE user_id = #{userId}
+        <if test="projectId != null">
+            AND project_id = #{projectId}
+        </if>
+        <if test="status != null">
+            AND status = #{status}
+        </if>
+    </select>
+
+    <update id="updateUploadId">
+        UPDATE import_record
+        SET upload_id = #{uploadId}, status = 1, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateStatus">
+        UPDATE import_record SET status = #{status}, update_time = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="tryStartProcessing">
+        UPDATE import_record
+        SET status = 5, error_msg = NULL, update_time = NOW()
+        WHERE id = #{id} AND status IN (0, 1)
+    </update>
+
+    <update id="updateStatusAndError">
+        UPDATE import_record SET status = #{status}, error_msg = #{errorMsg}, update_time = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateProgress">
+        UPDATE import_record
+        SET uploaded_chunks = #{uploadedChunks}, uploaded_bytes = #{uploadedBytes}, status = 1, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateFinish">
+        UPDATE import_record SET status = 3, finish_time = NOW(), update_time = NOW() WHERE id = #{id}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM import_record WHERE id = #{id}
+    </delete>
+
+</mapper>

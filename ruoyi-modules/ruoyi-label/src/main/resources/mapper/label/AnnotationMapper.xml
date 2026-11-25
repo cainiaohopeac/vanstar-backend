@@ -1,0 +1,588 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.AnnotationMapper">
+
+    <!-- ============ 标注工作台取数 ============ -->
+
+    <select id="selectJobAssets" resultType="org.dromara.label.vo.WorkAssetVO">
+        SELECT a.id AS assetId,
+               a.entry_id AS entryId,
+               -- 条目名称 / 编号：工作台底部状态栏要展示「属于哪条数据集合包」，缺失时回落到文件名
+               COALESCE(e.entry_name, a.file_name) AS entryName,
+               e.entry_no AS entryNo,
+               a.file_name AS fileName,
+               a.file_url AS fileUrl,
+               a.thumbnail_url AS thumbnailUrl,
+               a.media_type AS mediaType,
+               ja.sort_order AS sortOrder,
+               -- 逐帧插值需要按各帧自身分辨率归一化：同一条目内帧分辨率可能不同（如 1920x1080 混 960x544）
+               a.width AS width,
+               a.height AS height,
+               a.frame_flag AS frameFlag,
+               a.invalid_reason AS invalidReason,
+               -- 「数据明细」面板：条目所属批次与流转状态、标注员/审核员
+               COALESCE(b.batch_name, b.batch_no) AS batchName,
+               e.label_status AS entryLabelStatus,
+               e.review_status AS entryReviewStatus,
+               COALESCE(su.nick_name, su.user_name) AS assigneeName,
+               COALESCE(ru.nick_name, ru.user_name) AS reviewerName
+        FROM label_job_asset ja
+        JOIN label_asset a ON a.id = ja.asset_id
+        LEFT JOIN label_data_entry e ON e.id = a.entry_id
+        LEFT JOIN label_asset_batch b ON b.id = e.batch_id
+        LEFT JOIN sys_user su ON su.user_id = e.assignee_id
+        LEFT JOIN sys_user ru ON ru.user_id = e.reviewer_id
+        WHERE ja.job_id = #{jobId} AND a.deleted = 0
+        ORDER BY ja.sort_order, ja.id
+    </select>
+
+    <!--
+      「数据明细」面板的任务/批次概要：按作业反查任务名称、数据类型、批次名称与条目数量。
+      条目数量口径：作业有批次时统计该批次条目总数，否则统计任务全部条目数。
+    -->
+    <select id="selectJobTaskInfo" resultType="org.dromara.label.vo.JobTaskInfoVO">
+        SELECT t.task_no AS taskNo,
+               t.task_name AS taskName,
+               t.data_type AS dataType,
+               COALESCE(b.batch_name, b.batch_no) AS batchName,
+               (SELECT COUNT(*) FROM label_data_entry e2
+                 WHERE e2.deleted = 0 AND e2.task_id = j.task_id
+                   AND (j.batch_id IS NULL OR e2.batch_id = j.batch_id)) AS batchEntryCount,
+               j.data_type AS mediaType
+        FROM label_job j
+        JOIN label_task t ON t.id = j.task_id AND t.deleted = 0
+        LEFT JOIN label_asset_batch b ON b.id = j.batch_id
+        WHERE j.id = #{jobId}
+    </select>
+
+    <select id="selectProjectAssetsByJob" resultType="org.dromara.label.vo.WorkAssetVO">
+        SELECT a.id AS assetId,
+               a.entry_id AS entryId,
+               COALESCE(e.entry_name, a.file_name) AS entryName,
+               e.entry_no AS entryNo,
+               a.file_name AS fileName,
+               a.file_url AS fileUrl,
+               a.thumbnail_url AS thumbnailUrl,
+               a.media_type AS mediaType,
+               a.id AS sortOrder,
+               a.width AS width,
+               a.height AS height,
+               a.frame_flag AS frameFlag,
+               a.invalid_reason AS invalidReason
+        FROM label_asset a
+        JOIN label_job j ON j.project_id = a.project_id AND j.data_type = a.media_type
+        LEFT JOIN label_data_entry e ON e.id = a.entry_id
+        WHERE j.id = #{jobId} AND a.deleted = 0
+        ORDER BY a.id
+    </select>
+
+    <select id="selectJobReferenceImages" resultType="org.dromara.label.vo.WorkAssetVO">
+        SELECT a.id AS assetId,
+               a.file_name AS fileName,
+               a.file_url AS fileUrl,
+               a.thumbnail_url AS thumbnailUrl,
+               a.media_type AS mediaType
+        FROM label_asset a
+        JOIN label_job j ON j.project_id = a.project_id
+        WHERE j.id = #{jobId}
+          AND a.media_type = 'image'
+          AND a.deleted = 0
+          AND (j.batch_id IS NULL OR j.batch_id = 0 OR a.batch_id = j.batch_id)
+        ORDER BY a.file_name, a.id
+    </select>
+
+    <select id="selectJobPreAnnotationObjects" resultType="org.dromara.label.vo.WorkObjectVO">
+        SELECT pao.object_key AS objectKey,
+               pao.object_type AS type,
+               pao.class_id AS classId,
+               COALESCE(c.label_name, pao.class_name) AS className,
+               c.color,
+               pao.asset_id AS assetId,
+               JSON_UNQUOTE(JSON_EXTRACT(pao.geometry_json, '$')) AS geometryJson,
+               JSON_UNQUOTE(JSON_EXTRACT(pao.attr_json, '$')) AS attrJson,
+               0 AS pointCount
+        FROM label_pre_annotation_object pao
+        JOIN label_pre_annotation pa ON pa.id = pao.pre_annotation_id AND pa.deleted = 0
+        JOIN label_job_asset ja ON ja.asset_id = pao.asset_id AND ja.job_id = #{jobId}
+        LEFT JOIN label_class c ON c.id = pao.class_id
+        WHERE pao.deleted = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM label_annotation a
+              WHERE a.deleted = 0 AND a.job_id = #{jobId} AND a.asset_id = pao.asset_id
+          )
+        ORDER BY pao.asset_id, pao.id
+    </select>
+
+    <select id="selectAnnotationObjects" resultType="org.dromara.label.vo.WorkObjectVO">
+        SELECT ao.object_key AS objectKey,
+               ao.object_type AS type,
+               ao.class_id AS classId,
+               c.label_name AS className,
+               c.color,
+               ao.group_key AS groupKey,
+               ao.track_token AS trackToken,
+               a.asset_id AS assetId,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$')) AS geometryJson,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.attr_json, '$')) AS attrJson,
+               <!-- pointCount：pointIndices 兼容两种格式 —— 明文数组（JSON_LENGTH 取长度）
+                   与前端压缩后的编码对象 {enc:'drle-b64', n:总点数, data:...}（取 n 字段） -->
+              COALESCE(
+                CASE
+                  WHEN JSON_TYPE(JSON_EXTRACT(ao.geometry_json, '$.pointIndices')) = 'ARRAY'
+                    THEN JSON_LENGTH(JSON_EXTRACT(ao.geometry_json, '$.pointIndices'))
+                  ELSE JSON_EXTRACT(ao.geometry_json, '$.pointIndices.n')
+                END, 0) AS pointCount
+        FROM label_annotation a
+        JOIN (
+            -- 每个 (job, asset) 只取最新一条 header：历史 bug 曾对同一帧重复插入多条
+            -- header，对象行散挂在各条上 —— 不收敛的话，保存删的是最新 header 的行，
+            -- 加载却把老 header 上的活跃行全部带回来（「删除保存成功、刷新又回来」）
+            SELECT job_id, asset_id, MAX(id) AS id
+            FROM label_annotation
+            WHERE deleted = 0 AND job_id = #{jobId}
+            GROUP BY job_id, asset_id
+        ) cur ON cur.id = a.id
+        JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+        LEFT JOIN label_class c ON c.id = ao.class_id
+        WHERE a.deleted = 0 AND a.job_id = #{jobId}
+        ORDER BY ao.id
+    </select>
+
+    <select id="selectJobClasses" resultType="org.dromara.label.vo.WorkClassVO">
+        SELECT c.id AS classId, c.label_name AS className, c.color,
+               cs.id AS classSetId, cs.name AS classSetName,
+               c.tool_type AS toolType,
+               c.default_size_l AS defaultSizeL,
+               c.default_size_w AS defaultSizeW,
+               c.default_size_h AS defaultSizeH,
+               c.is_rigid AS isRigid,
+               c.min_inside_points AS minInsidePoints,
+               JSON_UNQUOTE(JSON_EXTRACT(c.keypoint_template_json, '$')) AS keypointTemplate
+        FROM label_job j
+        JOIN label_class_set cs ON cs.project_id = j.project_id AND cs.deleted = 0
+        JOIN label_class c ON c.class_set_id = cs.id AND c.deleted = 0
+        WHERE j.id = #{jobId}
+        ORDER BY c.sort_order, c.id
+    </select>
+
+    <select id="selectAnnotationIdByJobAsset" resultType="long">
+        SELECT id FROM label_annotation
+        WHERE job_id = #{jobId} AND asset_id = #{assetId} AND deleted = 0
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectJobIdByAsset" resultType="long">
+        SELECT a.job_id AS jobId
+        FROM label_annotation a
+        WHERE a.deleted = 0 AND a.asset_id = #{assetId}
+        ORDER BY a.update_time DESC, a.id DESC
+        LIMIT 1
+    </select>
+
+    <!-- ============ 保存标注 ============ -->
+
+    <insert id="insertAnnotation" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_annotation (
+            job_id, asset_id, annotator_id, version, status, annotation_json, created_by, updated_by
+        ) VALUES (
+            #{jobId}, #{assetId}, #{annotatorId}, 1, #{annotationStatus}, #{annotationJson},
+            #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="updateAnnotation" parameterType="map">
+        UPDATE label_annotation
+        SET status = #{annotationStatus}, annotation_json = #{annotationJson},
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{annotationId}
+    </update>
+
+    <!--
+      按「归属」软删对象（当前编辑 asset 的删除语义）：
+      覆盖该 job 下所有 annotation 头中归属为该 asset 的对象行 ——
+      1) attr_json.assetId 显式指向该 asset（历史缺陷曾把对象复制进其他 asset 的头，attr 里才是真实归属）；
+      2) attr_json 未携带 assetId 且行挂在 asset 自己的头下（老数据按头归属）。
+      仅按 annotation_id 软删会漏掉跨头拷贝，导致"删掉的对象保存后又回来"。
+    -->
+    <update id="softDeleteObjectsByAsset">
+        UPDATE label_annotation_object ao
+        JOIN label_annotation a ON a.id = ao.annotation_id
+            AND a.deleted = 0
+            AND a.job_id = #{jobId}
+        SET ao.deleted = 1, ao.updated_by = #{userId}, ao.update_time = NOW()
+        WHERE ao.deleted = 0
+          AND (
+              (
+                  JSON_VALID(ao.attr_json)
+                  AND JSON_UNQUOTE(JSON_EXTRACT(ao.attr_json, '$.assetId')) = CAST(#{assetId} AS CHAR)
+              )
+              OR (
+                  a.asset_id = #{assetId}
+                  AND (
+                      ao.attr_json IS NULL
+                      OR NOT JSON_VALID(ao.attr_json)
+                      OR JSON_EXTRACT(ao.attr_json, '$.assetId') IS NULL
+                  )
+              )
+          )
+    </update>
+
+    <!--
+      兜底清理：软删「本次 payload 未涉及的所有帧」的旧对象行。
+      前端 payload 是全量语义（整个作业所有 asset 的对象），因此凡不在本次保存中的帧，
+      其历史行都应被清空，否则会出现：
+        - 某帧对象被全部删除（或整条逐帧轨迹被删）后，只要当前帧不是那一帧，旧行就残留，
+          下次加载又把残留行带回来（表现为"删不掉的框"）。
+    -->
+    <update id="softDeleteObjectsExceptAssets">
+        UPDATE label_annotation_object ao
+        JOIN label_annotation a ON a.id = ao.annotation_id
+            AND a.deleted = 0
+            AND a.job_id = #{jobId}
+        SET ao.deleted = 1, ao.updated_by = #{userId}, ao.update_time = NOW()
+        WHERE ao.deleted = 0
+        <choose>
+            <!-- 有待保留的帧：清掉不属于这些帧的残留行 -->
+            <when test="keepAssetIds != null and keepAssetIds.size() > 0">
+                AND a.asset_id NOT IN
+                <foreach collection="keepAssetIds" item="assetId" open="(" separator="," close=")">
+                    #{assetId}
+                </foreach>
+            </when>
+            <!-- 一帧都不保留（作业内标注被删空）：该作业下所有对象行软删。
+                 不能渲染成 NOT IN () —— MySQL 会因空括号报语法错误。 -->
+            <otherwise>
+                AND 1 = 1
+            </otherwise>
+        </choose>
+    </update>
+
+    <insert id="insertAnnotationObject" parameterType="map">
+        INSERT INTO label_annotation_object (
+            annotation_id, object_key, object_type, class_id, group_key, geometry_json, attr_json,
+            track_token, created_by, updated_by
+        ) VALUES (
+            #{annotationId}, #{objectKey}, #{objectType}, #{classId}, #{groupKey}, #{geometryJson}, #{attrJson},
+            #{trackToken}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <!-- 批量版：一条 INSERT 带多行 VALUES，入参是 LabelAnnotationObjectRow 实体。
+         保存草稿的对象数是「帧数 × 轨迹数」，上千行逐条插入 = 上千次 RTT；
+         调用方按 500 行一批切分，避免单条 SQL 超过 max_allowed_packet。 -->
+    <insert id="insertAnnotationObjectRows" parameterType="java.util.List">
+        INSERT INTO label_annotation_object (
+            annotation_id, object_key, object_type, class_id, group_key, geometry_json, attr_json,
+            track_token, created_by, updated_by
+        ) VALUES
+        <foreach collection="list" item="p" separator=",">
+            (#{p.annotationId}, #{p.objectKey}, #{p.objectType}, #{p.classId}, #{p.groupKey}, #{p.geometryJson},
+            #{p.attrJson}, #{p.trackToken}, #{p.userId}, #{p.userId})
+        </foreach>
+    </insert>
+
+    <!-- 一次取回整作业的 assetId → annotationId，供批量保存复用，避免每帧查一次 -->
+    <select id="selectAnnotationIdsByJob" resultType="org.dromara.label.entity.LabelAnnotationIdRow">
+        SELECT a.asset_id AS assetId, a.id AS annotationId
+        FROM label_annotation a
+        JOIN (
+            -- 与加载口径一致：每个 asset 只认最新 header（历史重复行见加载 SQL 注释）
+            SELECT asset_id, MAX(id) AS id
+            FROM label_annotation
+            WHERE deleted = 0 AND job_id = #{jobId}
+            GROUP BY asset_id
+        ) cur ON cur.id = a.id
+        WHERE a.job_id = #{jobId} AND a.deleted = 0
+    </select>
+
+    <!-- 一次软删整作业的标注对象。
+         原实现拆成「删不在 payload 里的帧」+「每帧各删一次」，60 帧 = 61 次 UPDATE，
+         每次都带 JSON_EXTRACT(attr_json,'$.assetId')：JSON 函数无法走索引，只能全表扫描且逐行解析。
+         批量保存是全量语义（payload 已含所有应保留对象），删光整作业与之等价且只需一次。 -->
+    <!-- 全作业软删（softDeleteObjectsByJob）已废弃：增量保存只发改动帧，
+         全作业软删会把未发送帧的对象清掉（其它帧实例消失），且 deleted=1 的行
+         随保存次数无限堆积、JOIN 全表扫越来越慢（保存 78 秒的元凶）。
+         改为按「本次 payload 覆盖的 annotation」收窄软删范围 -->
+    <update id="softDeleteObjectsByAnnotationIds">
+        UPDATE label_annotation_object
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0
+          AND annotation_id IN
+        <foreach collection="annotationIds" item="aid" open="(" separator="," close=")">#{aid}</foreach>
+    </update>
+
+    <!-- ============ 对象轨迹（逐帧关键帧插值：存在范围与空洞） ============ -->
+
+    <select id="selectJobTracks" resultType="org.dromara.label.vo.ObjectTrackVO">
+        SELECT track_token AS trackToken,
+               entry_id AS entryId,
+               class_id AS classId,
+               first_asset_id AS firstAssetId,
+               last_asset_id AS lastAssetId,
+               JSON_UNQUOTE(JSON_EXTRACT(holes_json, '$')) AS holesJson,
+               JSON_UNQUOTE(JSON_EXTRACT(gaps_json, '$')) AS gapsJson,
+               interpolation
+        FROM label_object_track
+        WHERE deleted = 0 AND job_id = #{jobId}
+        ORDER BY id
+    </select>
+
+    <select id="selectTrackId" resultType="long">
+        SELECT id FROM label_object_track
+        WHERE deleted = 0 AND track_token = #{trackToken}
+        LIMIT 1
+    </select>
+
+    <update id="updateTrack">
+        UPDATE label_object_track
+        SET class_id = #{classId},
+            first_asset_id = #{firstAssetId},
+            last_asset_id = #{lastAssetId},
+            holes_json = #{holesJson},
+            gaps_json = #{gapsJson},
+            interpolation = #{interpolation},
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0 AND track_token = #{trackToken}
+    </update>
+
+    <insert id="insertTrack" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_object_track (
+            project_id, job_id, entry_id, track_token, class_id,
+            first_asset_id, last_asset_id, holes_json, gaps_json, interpolation,
+            created_by, updated_by
+        ) VALUES (
+            -- project_id 由 job 反查回填：JobVO 不携带项目维度，避免为此再查一次表
+            (SELECT project_id FROM label_job WHERE id = #{jobId}),
+            #{jobId}, #{entryId}, #{trackToken}, #{classId},
+            #{firstAssetId}, #{lastAssetId}, #{holesJson}, #{gapsJson}, #{interpolation},
+            #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="deleteTrack">
+        UPDATE label_object_track
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND track_token = #{trackToken}
+    </update>
+
+    <update id="updateJobProgressAndStatus">
+        UPDATE label_job
+        SET status = #{status}, progress = #{progress}, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{jobId}
+    </update>
+
+    <update id="updateAssetLabelStatus">
+        UPDATE label_asset
+        SET label_status = CASE
+                WHEN label_status = 'revising' AND #{labelStatus} = 'labeling' THEN 'revising'
+                ELSE #{labelStatus} END,
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{assetId} AND deleted = 0
+    </update>
+
+    <!-- 未归入数据条目的数据资产兜底：提交审核后置为已标注/已修订，并重置审核状态为未审核 -->
+    <update id="updateAssetSubmitStatus">
+        UPDATE label_asset
+        SET label_status = CASE
+                WHEN label_status IN ('unrevised', 'revising', 'revised') THEN 'revised'
+                ELSE 'labeled' END,
+            review_status = 'none',
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{assetId} AND deleted = 0
+    </update>
+
+    <!-- 数据资产所属的数据条目（数据集合包） -->
+    <select id="selectEntryIdByAssetId" resultType="long">
+        SELECT entry_id FROM label_asset WHERE id = #{assetId} AND deleted = 0
+    </select>
+
+    <!-- 数据条目当前的标注状态（区分首次提交与修订后提交） -->
+    <select id="selectEntryLabelStatus" resultType="string">
+        SELECT label_status FROM label_data_entry WHERE id = #{entryId} AND deleted = 0
+    </select>
+
+    <!--
+      提交审核：条目（数据集合包）内的数据随条目一起流转，
+      统一置为「已标注/已修订」，并把审核状态重置为「未审核」，进入待审核。
+      已放弃的数据不参与流转。
+    -->
+    <update id="submitEntryAssets">
+        UPDATE label_asset
+        SET label_status = #{labelStatus},
+            review_status = 'none',
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND entry_id = #{entryId}
+          AND label_status &lt;&gt; 'abandoned'
+    </update>
+
+    <!-- 提交审核：条目置为「已标注/已修订」，审核状态重置为「未审核」 -->
+    <update id="submitEntryStatus">
+        UPDATE label_data_entry
+        SET label_status = #{labelStatus},
+            review_status = 'none',
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0 AND id = #{entryId}
+    </update>
+
+    <!--
+      作业（一批条目）的条目进度，用于按「条目」为单位聚合作业状态：
+      total=作业覆盖的条目总数，done=已进入待审核或终态（已标注/已修订/已跳过/已放弃）的条目数。
+    -->
+    <select id="selectJobEntryProgress" resultType="map">
+        SELECT COUNT(DISTINCT a.entry_id) AS total,
+               COUNT(DISTINCT CASE
+                   WHEN IFNULL(e.label_status, a.label_status)
+                        IN ('labeled', 'revised', 'skipped', 'abandoned')
+                   THEN a.entry_id END) AS done
+        FROM label_job_asset ja
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+        LEFT JOIN label_data_entry e ON e.id = a.entry_id AND e.deleted = 0
+        WHERE ja.deleted = 0 AND ja.job_id = #{jobId}
+    </select>
+
+    <select id="selectClassIdByName" resultType="long">
+        SELECT c.id
+        FROM label_job j
+        JOIN label_class_set cs ON cs.project_id = j.project_id AND cs.deleted = 0
+        JOIN label_class c ON c.class_set_id = cs.id AND c.deleted = 0
+        WHERE j.id = #{jobId} AND c.label_name = #{className}
+        LIMIT 1
+    </select>
+
+    <select id="selectFirstClassId" resultType="long">
+        SELECT c.id
+        FROM label_job j
+        JOIN label_class_set cs ON cs.project_id = j.project_id AND cs.deleted = 0
+        JOIN label_class c ON c.class_set_id = cs.id AND c.deleted = 0
+        WHERE j.id = #{jobId}
+        ORDER BY c.sort_order, c.id
+        LIMIT 1
+    </select>
+
+    <!-- ============ 标注对象级批注（框级批注） ============ -->
+
+    <select id="selectObjectComments" resultType="org.dromara.label.vo.ObjectCommentVO">
+        SELECT oc.id,
+               oc.job_id AS jobId,
+               oc.asset_id AS assetId,
+               oc.object_key AS objectKey,
+               oc.node,
+               oc.comment_type AS commentType,
+               oc.content,
+               oc.pos_x AS posX,
+               oc.pos_y AS posY,
+               oc.pos_z AS posZ,
+               oc.status,
+               oc.created_by AS createdBy,
+               u.nick_name AS createdByName,
+               oc.create_time AS createTime
+        FROM label_object_comment oc
+        LEFT JOIN sys_user u ON u.user_id = oc.created_by
+        WHERE oc.deleted = 0 AND oc.job_id = #{jobId}
+        <if test="assetId != null">
+            AND oc.asset_id = #{assetId}
+        </if>
+        ORDER BY oc.id
+    </select>
+
+    <insert id="insertObjectComment" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO label_object_comment (
+            job_id, asset_id, object_key, node, comment_type, content, pos_x, pos_y, pos_z, status, created_by, updated_by
+        ) VALUES (
+            #{jobId}, #{assetId}, #{objectKey}, #{node}, #{commentType}, #{content}, #{posX}, #{posY}, #{posZ}, 'open', #{createdBy}, #{updatedBy}
+        )
+    </insert>
+
+    <update id="deleteObjectComment">
+        UPDATE label_object_comment
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{commentId} AND deleted = 0
+        <if test="userId != null">
+            AND created_by = #{userId}
+        </if>
+    </update>
+
+    <!-- 标注环节「确认已修改」：只改 status，不校验创建人（批注由审核人创建，标注员负责确认） -->
+    <update id="updateObjectCommentStatus">
+        UPDATE label_object_comment
+        SET status = #{status}, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{commentId} AND deleted = 0
+    </update>
+
+    <!--
+      级联软删「宿主实例已不存在」的实例批注（保存标注时调用）：
+      范围 = 本次保存覆盖的帧；objectKey 不在提交对象集合里的批注一律软删。
+      不校验 created_by：实例被删是系统事实，审核员写的批注同样要清掉，
+      否则帧格一直标黄、批注列表里却找不到对应实例。
+    -->
+    <update id="purgeOrphanObjectComments" parameterType="map">
+        UPDATE label_object_comment
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0
+          AND job_id = #{jobId}
+          AND object_key IS NOT NULL
+          AND asset_id IN
+            <foreach collection="assetIds" item="aid" open="(" separator="," close=")">#{aid}</foreach>
+        <if test="objectKeys != null and objectKeys.size() > 0">
+          AND object_key NOT IN
+            <foreach collection="objectKeys" item="k" open="(" separator="," close=")">#{k}</foreach>
+        </if>
+    </update>
+
+    <select id="selectAnnotationComment" resultType="string">
+        SELECT JSON_UNQUOTE(JSON_EXTRACT(a.annotation_json, '$.comment'))
+        FROM label_annotation a
+        WHERE a.deleted = 0 AND a.job_id = #{jobId} AND a.asset_id = #{assetId}
+        ORDER BY a.id DESC
+        LIMIT 1
+    </select>
+
+    <!-- 帧级全局属性值：取当前激活资产最近一次存档的 $.globalAttrs（JSON 文本，Service 层反解析） -->
+    <select id="selectAnnotationGlobalAttrs" resultType="string">
+        SELECT JSON_UNQUOTE(JSON_EXTRACT(a.annotation_json, '$.globalAttrs'))
+        FROM label_annotation a
+        WHERE a.deleted = 0 AND a.job_id = #{jobId} AND a.asset_id = #{assetId}
+        ORDER BY a.id DESC
+        LIMIT 1
+    </select>
+
+    <!-- 批量读取帧批注/全局属性：导出 sidecar 一次查询全部资产，避免逐帧查库 -->
+    <select id="selectFrameAnnotationMeta" resultType="java.util.HashMap">
+        SELECT a.asset_id AS assetId,
+               a.job_id AS jobId,
+               JSON_UNQUOTE(JSON_EXTRACT(a.annotation_json, '$.globalAttrs')) AS globalAttrs,
+               JSON_UNQUOTE(JSON_EXTRACT(a.annotation_json, '$.comment')) AS comment
+        FROM label_annotation a
+        WHERE a.deleted = 0
+          AND a.asset_id IN
+          <foreach collection="assetIds" item="aid" open="(" separator="," close=")">#{aid}</foreach>
+        ORDER BY a.asset_id, a.id DESC
+    </select>
+
+    <!-- ============ 单帧无效 ============ -->
+
+    <update id="updateAssetFrameFlag">
+        UPDATE label_asset
+        SET frame_flag = #{frameFlag},
+            invalid_reason = #{invalidReason},
+            invalid_by = #{userId},
+            invalid_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{assetId} AND deleted = 0
+    </update>
+
+    <select id="selectAssetFrameFlag" resultType="string">
+        SELECT frame_flag
+        FROM label_asset
+        WHERE id = #{assetId} AND deleted = 0
+    </select>
+</mapper>

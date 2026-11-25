@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.TaskMemberMapper">
+
+    <!--
+      任务下发团队范围：优先取任务-团队多对多关联，兼容仅有 label_task.team_id 主团队的历史任务。
+      要求外层传入 taskId 参数。
+    -->
+    <sql id="taskTeamScope">
+        SELECT tt.team_id AS team_id
+        FROM label_task_team tt
+        WHERE tt.task_id = #{taskId} AND tt.deleted = 0
+        UNION
+        SELECT t.team_id AS team_id
+        FROM label_task t
+        WHERE t.id = #{taskId} AND t.deleted = 0 AND t.team_id IS NOT NULL
+    </sql>
+
+    <select id="selectCandidates" resultType="org.dromara.label.vo.TaskMemberVO">
+        SELECT u.user_id AS userId,
+               u.user_name AS userName,
+               u.nick_name AS nickName,
+               GROUP_CONCAT(DISTINCT team.team_name ORDER BY team.team_name SEPARATOR '、') AS teamName,
+               GROUP_CONCAT(DISTINCT tm.team_role) AS teamRole,
+               MAX(join_m.member_role) AS memberRole,
+               MAX(CASE WHEN join_m.id IS NULL THEN 0 ELSE 1 END) AS joined,
+               MAX(join_m.node_key) AS nodeKey,
+               MAX(join_node.node_name) AS nodeName
+        FROM label_team_member tm
+        JOIN sys_user u ON u.user_id = tm.user_id
+        JOIN label_team team ON team.id = tm.team_id AND team.deleted = 0
+        JOIN (<include refid="taskTeamScope"/>) tscope ON tscope.team_id = tm.team_id
+        LEFT JOIN label_task_member join_m
+               ON join_m.task_id = #{taskId} AND join_m.user_id = tm.user_id AND join_m.deleted = 0
+        LEFT JOIN label_task join_t ON join_t.id = #{taskId} AND join_t.deleted = 0
+        LEFT JOIN label_workflow_node join_node
+               ON join_node.project_id = join_t.project_id
+              AND join_node.node_key = join_m.node_key
+              AND join_node.deleted = 0
+        WHERE tm.deleted = 0
+        GROUP BY u.user_id, u.user_name, u.nick_name
+        ORDER BY joined DESC, u.user_id
+    </select>
+
+    <select id="countMember" resultType="int">
+        SELECT COUNT(*)
+        FROM label_task_member
+        WHERE task_id = #{taskId} AND user_id = #{userId} AND deleted = 0
+    </select>
+
+    <select id="countMembers" resultType="long">
+        SELECT COUNT(*)
+        FROM label_task_member
+        WHERE task_id = #{taskId} AND deleted = 0
+    </select>
+
+    <select id="countTaskTeamMember" resultType="int">
+        SELECT COUNT(*)
+        FROM label_team_member tm
+        JOIN (<include refid="taskTeamScope"/>) tscope ON tscope.team_id = tm.team_id
+        WHERE tm.deleted = 0 AND tm.user_id = #{userId}
+    </select>
+
+    <select id="selectTaskTeamMemberUserIds" resultType="long">
+        SELECT DISTINCT tm.user_id
+        FROM label_team_member tm
+        JOIN (<include refid="taskTeamScope"/>) tscope ON tscope.team_id = tm.team_id
+        WHERE tm.deleted = 0
+    </select>
+
+    <select id="selectCreatorId" resultType="long">
+        SELECT creator_id FROM label_task WHERE id = #{taskId} AND deleted = 0
+    </select>
+
+    <select id="selectMemberRole" resultType="string">
+        SELECT member_role
+        FROM label_task_member
+        WHERE task_id = #{taskId} AND user_id = #{userId} AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <insert id="insertMember">
+        INSERT INTO label_task_member (task_id, user_id, node_key, created_by, updated_by)
+        VALUES (#{taskId}, #{userId}, #{nodeKey}, #{operator}, #{operator})
+        ON DUPLICATE KEY UPDATE deleted = 0, node_key = VALUES(node_key),
+                                updated_by = #{operator}, update_time = NOW()
+    </insert>
+
+    <update id="updateMemberRole">
+        UPDATE label_task_member
+        SET member_role = #{role}, updated_by = #{operator}, update_time = NOW()
+        WHERE task_id = #{taskId} AND user_id = #{userId} AND deleted = 0
+    </update>
+
+    <select id="selectMemberNodeKey" resultType="string">
+        SELECT node_key
+        FROM label_task_member
+        WHERE task_id = #{taskId} AND user_id = #{userId} AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <update id="updateMemberNode">
+        UPDATE label_task_member
+        SET node_key = #{nodeKey}, updated_by = #{operator}, update_time = NOW()
+        WHERE task_id = #{taskId} AND user_id = #{userId} AND deleted = 0
+    </update>
+</mapper>

@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.TextImportMapper">
+
+    <!-- ============ 上传记录 ============ -->
+
+    <insert id="insertUpload" parameterType="org.dromara.label.entity.LabelUpload"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_upload (
+            project_id, batch_id, upload_no, file_name, file_size, object_name,
+            source_type, asset_count, status, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadNo}, #{fileName}, #{fileSize}, #{objectName},
+            #{sourceType}, #{assetCount}, #{status}, #{createBy}, #{updateBy}
+        )
+    </insert>
+
+    <!-- ============ 条目 ============ -->
+
+    <insert id="insertEntry" parameterType="org.dromara.label.entity.LabelDataEntry"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_data_entry (
+            project_id, batch_id, upload_id, entry_no, entry_name, source_file, seq_no,
+            asset_count, split_mode, media_type, parse_status, label_status, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadId}, #{entryNo}, #{entryName}, #{sourceFile}, #{seqNo},
+            #{assetCount}, #{splitMode}, #{mediaType}, #{parseStatus}, #{labelStatus},
+            #{createBy}, #{updateBy}
+        )
+    </insert>
+
+    <!-- ============ 资产 ============ -->
+
+    <insert id="insertAsset" parameterType="org.dromara.label.entity.LabelAsset"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_asset (
+            project_id, batch_id, upload_id, entry_id, media_type, file_name, file_url,
+            file_size, parse_status, meta_json, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadId}, #{entryId}, #{mediaType}, #{fileName}, #{fileUrl},
+            #{fileSize}, #{parseStatus}, #{metaJson}, #{createBy}, #{updateBy}
+        )
+    </insert>
+
+    <update id="bindAssetEntry">
+        UPDATE label_asset
+        SET entry_id = #{entryId}, updated_by = #{updateBy}, update_time = NOW()
+        WHERE id = #{assetId} AND deleted = 0
+    </update>
+
+    <update id="updateEntryAssetInfo">
+        UPDATE label_data_entry
+        SET asset_count = #{assetCount},
+            first_asset_id = #{firstAssetId},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{entryId} AND deleted = 0
+    </update>
+
+</mapper>

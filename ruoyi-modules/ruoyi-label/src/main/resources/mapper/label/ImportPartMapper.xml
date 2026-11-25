@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.ImportPartMapper">
+
+    <insert id="upsert" parameterType="org.dromara.label.entity.ImportPart">
+        INSERT INTO import_part (record_id, part_number, etag, part_size, create_time)
+        VALUES (#{recordId}, #{partNumber}, #{etag}, #{partSize}, NOW())
+        ON DUPLICATE KEY UPDATE etag = VALUES(etag), part_size = VALUES(part_size)
+    </insert>
+
+    <select id="selectByRecordId" resultType="org.dromara.label.entity.ImportPart">
+        SELECT * FROM import_part WHERE record_id = #{recordId} ORDER BY part_number
+    </select>
+
+    <select id="countByRecordId" resultType="int">
+        SELECT COUNT(*) FROM import_part WHERE record_id = #{recordId}
+    </select>
+
+    <select id="sumSizeByRecordId" resultType="long">
+        SELECT COALESCE(SUM(part_size), 0) FROM import_part WHERE record_id = #{recordId}
+    </select>
+
+    <delete id="deleteByRecordId">
+        DELETE FROM import_part WHERE record_id = #{recordId}
+    </delete>
+
+</mapper>

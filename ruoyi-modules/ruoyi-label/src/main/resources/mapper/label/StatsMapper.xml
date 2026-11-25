@@ -1,0 +1,480 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.StatsMapper">
+
+    <!--
+      统计口径说明：
+        1. 产能口径 = label_entry_node.status = 'done'，按 done_time 归日；
+        2. 团队范围 = 任务团队 / 项目主团队 / 项目关联团队三者任一命中；
+        3. 帧 = COALESCE(annotation.frame_id, annotation.asset_id, asset.id)，
+           图片/文本项目退化为资产粒度，序列项目为帧粒度；
+        4. 有标签帧 = 单元内至少 1 个未删除标注对象，无标签帧 = 处理过但产出为空。
+    -->
+
+    <sql id="memberName">
+        COALESCE(NULLIF(u.nick_name, ''), u.user_name, CONCAT('用户', n.operator_id))
+    </sql>
+
+    <sql id="entryScope">
+        <if test="q.projectId != null"> AND p.id = #{q.projectId} </if>
+        <if test="q.taskId != null"> AND t.id = #{q.taskId} </if>
+        <if test="q.teamId != null">
+            AND (t.team_id = #{q.teamId} OR p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        <if test="q.nodeKey != null and q.nodeKey != ''"> AND n.node_key = #{q.nodeKey} </if>
+        <if test="q.memberIds != null and q.memberIds.size() > 0">
+            AND n.operator_id IN
+            <foreach collection="q.memberIds" item="mid" open="(" separator="," close=")">#{mid}</foreach>
+        </if>
+        <!-- 批次细筛（条目维度）：条目无批次列，经其资产归属批次 -->
+        <if test="q.batchIds != null and q.batchIds.size() > 0">
+            AND EXISTS (SELECT 1 FROM label_asset ba
+                        WHERE ba.entry_id = n.entry_id AND ba.deleted = 0
+                        AND ba.batch_id IN
+                        <foreach collection="q.batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>)
+        </if>
+    </sql>
+
+    <!--
+      产出范围（标签数 / 帧数）：
+        标签与帧是「标注动作」的产物，只归属标注类节点，不随审核节点切换重复计数。
+        因此未指定节点时取全部 done；指定标注类节点时按该节点；指定审核类节点时
+        仍回落到标注节点产出（同一批条目），保证「成员标签工作量」稳定可比。
+    -->
+    <sql id="outputScope">
+        <if test="q.projectId != null"> AND p.id = #{q.projectId} </if>
+        <if test="q.taskId != null"> AND t.id = #{q.taskId} </if>
+        <if test="q.teamId != null">
+            AND (t.team_id = #{q.teamId} OR p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        <choose>
+            <when test="labelOnly == true"> AND n.node_type = 'label' </when>
+            <when test="q.nodeKey != null and q.nodeKey != ''"> AND n.node_key = #{q.nodeKey} </when>
+        </choose>
+        <if test="q.memberIds != null and q.memberIds.size() > 0">
+            AND n.operator_id IN
+            <foreach collection="q.memberIds" item="mid" open="(" separator="," close=")">#{mid}</foreach>
+        </if>
+        <!-- 条目细筛（仅「成员标签工作量」请求会带 entryIds，其它端点 body 不传该字段自然不受影响） -->
+        <if test="q.entryIds != null and q.entryIds.size() > 0">
+            AND ast.entry_id IN
+            <foreach collection="q.entryIds" item="eid" open="(" separator="," close=")">#{eid}</foreach>
+        </if>
+        <!-- 批次细筛：资产直接归属批次（label_asset.batch_id），帧/标签类产出按资产批次过滤 -->
+        <if test="q.batchIds != null and q.batchIds.size() > 0">
+            AND ast.batch_id IN
+            <foreach collection="q.batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+        </if>
+    </sql>
+
+    <sql id="entryFrom">
+        FROM label_entry_node n
+        INNER JOIN label_task t ON t.id = n.task_id AND t.deleted = 0
+        INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        LEFT JOIN sys_user u ON u.user_id = n.operator_id
+    </sql>
+
+    <!-- ============================ 成员工作量 ============================ -->
+
+    <select id="selectMemberEntries" resultType="org.dromara.label.vo.StatsMemberEntryVO">
+        SELECT n.operator_id AS memberId,
+               <include refid="memberName"/> AS memberName,
+               COUNT(*) AS doneCount,
+               COALESCE(ROUND(AVG(CASE WHEN n.claim_time IS NOT NULL AND n.done_time IS NOT NULL
+                     THEN TIMESTAMPDIFF(SECOND, n.claim_time, n.done_time) END)), 0) AS avgSeconds
+        <include refid="entryFrom"/>
+        WHERE n.deleted = 0
+          AND n.status = 'done'
+          AND n.operator_id IS NOT NULL
+          AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+        <include refid="entryScope"/>
+        GROUP BY n.operator_id, u.nick_name, u.user_name
+        ORDER BY doneCount DESC, avgSeconds ASC
+        <if test="q.limit != null"> LIMIT #{q.limit} </if>
+    </select>
+
+    <select id="selectMemberDisposals" resultType="org.dromara.label.vo.StatsMemberEntryVO">
+        SELECT n.operator_id AS memberId,
+               SUM(CASE WHEN n.status = 'claimed' THEN 1 ELSE 0 END) AS processingCount,
+               SUM(CASE WHEN n.status = 'skipped' THEN 1 ELSE 0 END) AS skippedCount,
+               SUM(CASE WHEN n.status = 'abandoned' THEN 1 ELSE 0 END) AS abandonedCount
+        <include refid="entryFrom"/>
+        WHERE n.deleted = 0
+          AND n.status IN ('claimed', 'skipped', 'abandoned')
+          AND n.operator_id IS NOT NULL
+          AND n.update_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.update_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+        <include refid="entryScope"/>
+        GROUP BY n.operator_id
+    </select>
+
+    <select id="selectMemberOutput" resultType="org.dromara.label.vo.StatsMemberOutputVO">
+        SELECT s.memberId AS memberId,
+               s.memberName AS memberName,
+               COUNT(DISTINCT s.unitKey) AS totalFrames,
+               COUNT(DISTINCT CASE WHEN s.tagCnt &gt; 0 THEN s.unitKey END) AS labeledFrames,
+               COUNT(DISTINCT CASE WHEN s.tagCnt = 0 THEN s.unitKey END) AS emptyFrames,
+               COALESCE(SUM(s.tagCnt), 0) AS tagCount
+        FROM (
+            SELECT n.operator_id AS memberId,
+                   <include refid="memberName"/> AS memberName,
+                   COALESCE(a.frame_id, a.asset_id, ast.id) AS unitKey,
+                   <!-- 统计口径：只统计有效实框 —— 关键帧/落实帧对象行，且所在帧未被标记无效 -->
+                   COUNT(CASE WHEN ast.frame_flag IS NULL OR ast.frame_flag = 'normal' THEN ao.id END) AS tagCnt
+            FROM label_entry_node n
+            INNER JOIN label_task t ON t.id = n.task_id AND t.deleted = 0
+            INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+            INNER JOIN label_asset ast ON ast.entry_id = n.entry_id AND ast.deleted = 0
+            INNER JOIN label_annotation a ON a.asset_id = ast.id AND a.deleted = 0
+            LEFT JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+            LEFT JOIN sys_user u ON u.user_id = n.operator_id
+            WHERE n.deleted = 0
+              AND n.status = 'done'
+              AND n.operator_id IS NOT NULL
+              AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+              AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+            <include refid="outputScope"/>
+            GROUP BY n.operator_id, u.nick_name, u.user_name,
+                     COALESCE(a.frame_id, a.asset_id, ast.id)
+        ) s
+        GROUP BY s.memberId, s.memberName
+        ORDER BY tagCount DESC
+        <if test="q.limit != null"> LIMIT #{q.limit} </if>
+    </select>
+
+    <!--
+      成员标签按几何类别聚合（成员标签工作量「按类别汇总」口径）：
+        kind 取 geometry_json.$.kind，缺失时回落 object_type，归类：
+        点 = keypoint/skeleton/point；线 = polyline/line；
+        2D框 = bbox/rect（含兜底）；2D分割框 = polygon/brush/mask；
+        3D框 = cuboid；3D分割 = point_cloud_instance/segmentation。
+      数量口径与 selectMemberOutput 一致：只统计有效实框（所在帧未被标记无效）。
+    -->
+    <select id="selectMemberTagKinds" resultType="org.dromara.label.vo.StatsTagKindVO">
+        SELECT n.operator_id AS memberId,
+               <include refid="memberName"/> AS memberName,
+               CASE
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) = 'cuboid' THEN 'box3d'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('point_cloud_instance', 'segmentation') THEN 'seg3d'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('keypoint', 'skeleton', 'point') THEN 'point'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('polyline', 'line') THEN 'line'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('polygon', 'brush', 'mask') THEN 'seg2d'
+                   ELSE 'box2d'
+               END AS kind,
+               COUNT(*) AS cnt
+        FROM label_entry_node n
+        INNER JOIN label_task t ON t.id = n.task_id AND t.deleted = 0
+        INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        INNER JOIN label_asset ast ON ast.entry_id = n.entry_id AND ast.deleted = 0
+        INNER JOIN label_annotation a ON a.asset_id = ast.id AND a.deleted = 0
+        INNER JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+        LEFT JOIN sys_user u ON u.user_id = n.operator_id
+        WHERE n.deleted = 0
+          AND n.status = 'done'
+          AND n.operator_id IS NOT NULL
+          AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+          AND (ast.frame_flag IS NULL OR ast.frame_flag = 'normal')
+        <include refid="outputScope"/>
+        GROUP BY n.operator_id, u.nick_name, u.user_name, kind
+        ORDER BY memberId ASC, cnt DESC
+    </select>
+
+    <!--
+      成员标签按「几何类别 × 标签类」聚合（标签工作量层级表头表格）：
+        二级=kind（同 selectMemberTagKinds 口径），三级=label_class.label_name（JOIN ao.class_id）；
+        数量口径与 selectMemberOutput 一致：只统计有效实框。
+    -->
+    <select id="selectMemberTagClasses" resultType="org.dromara.label.vo.StatsTagClassVO">
+        SELECT n.operator_id AS memberId,
+               <include refid="memberName"/> AS memberName,
+               CASE
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) = 'cuboid' THEN 'box3d'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('point_cloud_instance', 'segmentation') THEN 'seg3d'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('keypoint', 'skeleton', 'point') THEN 'point'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('polyline', 'line') THEN 'line'
+                   WHEN COALESCE(JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$.kind')), ao.object_type) IN ('polygon', 'brush', 'mask') THEN 'seg2d'
+                   ELSE 'box2d'
+               END AS kind,
+               COALESCE(ao.class_id, 0) AS classId,
+               COALESCE(lc.label_name, CONCAT('未指定标签#', COALESCE(ao.class_id, 0))) AS className,
+               COUNT(*) AS cnt
+        FROM label_entry_node n
+        INNER JOIN label_task t ON t.id = n.task_id AND t.deleted = 0
+        INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        INNER JOIN label_asset ast ON ast.entry_id = n.entry_id AND ast.deleted = 0
+        INNER JOIN label_annotation a ON a.asset_id = ast.id AND a.deleted = 0
+        INNER JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+        LEFT JOIN label_class lc ON lc.id = ao.class_id AND lc.deleted = 0
+        LEFT JOIN sys_user u ON u.user_id = n.operator_id
+        WHERE n.deleted = 0
+          AND n.status = 'done'
+          AND n.operator_id IS NOT NULL
+          AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+          AND (ast.frame_flag IS NULL OR ast.frame_flag = 'normal')
+        <include refid="outputScope"/>
+        GROUP BY n.operator_id, u.nick_name, u.user_name, kind, COALESCE(ao.class_id, 0),
+                 COALESCE(lc.label_name, CONCAT('未指定标签#', COALESCE(ao.class_id, 0)))
+        ORDER BY memberId ASC, kind ASC, cnt DESC
+    </select>
+
+    <!-- ============================ 每日矩阵 ============================ -->
+
+    <select id="selectDailyEntries" resultType="org.dromara.label.vo.StatsDailyCellVO">
+        SELECT n.operator_id AS memberId,
+               <include refid="memberName"/> AS memberName,
+               DATE_FORMAT(n.done_time, '%Y-%m-%d') AS day,
+               COUNT(*) AS value
+        <include refid="entryFrom"/>
+        WHERE n.deleted = 0
+          AND n.status = 'done'
+          AND n.operator_id IS NOT NULL
+          AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+        <include refid="entryScope"/>
+        GROUP BY n.operator_id, u.nick_name, u.user_name, DATE_FORMAT(n.done_time, '%Y-%m-%d')
+        ORDER BY day ASC
+    </select>
+
+    <select id="selectDailyOutput" resultType="org.dromara.label.vo.StatsDailyCellVO">
+        SELECT s.memberId AS memberId,
+               s.memberName AS memberName,
+               s.day AS day,
+               <choose>
+                   <when test="metric == 'tag'">COALESCE(SUM(s.tagCnt), 0)</when>
+                   <otherwise>COUNT(DISTINCT s.unitKey)</otherwise>
+               </choose> AS value
+        FROM (
+            SELECT n.operator_id AS memberId,
+                   <include refid="memberName"/> AS memberName,
+                   DATE_FORMAT(n.done_time, '%Y-%m-%d') AS day,
+                   COALESCE(a.frame_id, a.asset_id, ast.id) AS unitKey,
+                   <!-- 统计口径：只统计有效实框 —— 关键帧/落实帧对象行，且所在帧未被标记无效 -->
+                   COUNT(CASE WHEN ast.frame_flag IS NULL OR ast.frame_flag = 'normal' THEN ao.id END) AS tagCnt
+            FROM label_entry_node n
+            INNER JOIN label_task t ON t.id = n.task_id AND t.deleted = 0
+            INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+            INNER JOIN label_asset ast ON ast.entry_id = n.entry_id AND ast.deleted = 0
+            INNER JOIN label_annotation a ON a.asset_id = ast.id AND a.deleted = 0
+            LEFT JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+            LEFT JOIN sys_user u ON u.user_id = n.operator_id
+            WHERE n.deleted = 0
+              AND n.status = 'done'
+              AND n.operator_id IS NOT NULL
+              AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+              AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+            <include refid="outputScope"/>
+            GROUP BY n.operator_id, u.nick_name, u.user_name,
+                     DATE_FORMAT(n.done_time, '%Y-%m-%d'),
+                     COALESCE(a.frame_id, a.asset_id, ast.id)
+        ) s
+        GROUP BY s.memberId, s.memberName, s.day
+        ORDER BY s.day ASC
+    </select>
+
+    <!-- ============================ 工时 ============================ -->
+
+    <select id="selectWorkSessionDaily" resultType="org.dromara.label.vo.StatsWorkCellVO">
+        SELECT ws.user_id AS memberId,
+               COALESCE(NULLIF(u.nick_name, ''), u.user_name, CONCAT('用户', ws.user_id)) AS memberName,
+               DATE_FORMAT(ws.work_date, '%Y-%m-%d') AS day,
+               COALESCE(SUM(ws.active_seconds), 0) AS seconds,
+               0 AS doneCount
+        FROM label_work_session ws
+        LEFT JOIN sys_user u ON u.user_id = ws.user_id
+        LEFT JOIN label_task t ON t.id = ws.task_id AND t.deleted = 0
+        LEFT JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        WHERE ws.deleted = 0
+          AND ws.work_date &gt;= #{q.startDate}
+          AND ws.work_date &lt;= #{q.endDate}
+        <if test="q.projectId != null"> AND (ws.project_id = #{q.projectId} OR p.id = #{q.projectId}) </if>
+        <if test="q.taskId != null"> AND ws.task_id = #{q.taskId} </if>
+        <if test="q.nodeKey != null and q.nodeKey != ''"> AND ws.node_key = #{q.nodeKey} </if>
+        <if test="q.teamId != null">
+            AND (t.team_id = #{q.teamId} OR p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        <if test="q.memberIds != null and q.memberIds.size() > 0">
+            AND ws.user_id IN
+            <foreach collection="q.memberIds" item="mid" open="(" separator="," close=")">#{mid}</foreach>
+        </if>
+        GROUP BY ws.user_id, u.nick_name, u.user_name, ws.work_date
+        ORDER BY day ASC
+    </select>
+
+    <select id="selectEntrySpanDaily" resultType="org.dromara.label.vo.StatsWorkCellVO">
+        SELECT n.operator_id AS memberId,
+               <include refid="memberName"/> AS memberName,
+               DATE_FORMAT(n.done_time, '%Y-%m-%d') AS day,
+               COALESCE(SUM(LEAST(TIMESTAMPDIFF(SECOND, n.claim_time, n.done_time), #{capSeconds})), 0) AS seconds,
+               COUNT(*) AS doneCount
+        <include refid="entryFrom"/>
+        WHERE n.deleted = 0
+          AND n.status = 'done'
+          AND n.operator_id IS NOT NULL
+          AND n.claim_time IS NOT NULL
+          AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+        <include refid="entryScope"/>
+        GROUP BY n.operator_id, u.nick_name, u.user_name, DATE_FORMAT(n.done_time, '%Y-%m-%d')
+        ORDER BY day ASC
+    </select>
+
+    <!-- ============================ 质量 ============================ -->
+
+    <select id="selectMemberQuality" resultType="org.dromara.label.vo.StatsQualityVO">
+        SELECT n.operator_id AS memberId,
+               <include refid="memberName"/> AS memberName,
+               COUNT(*) AS submittedCount,
+               SUM(CASE WHEN e.review_status IN ('passed', 'rejected', 're_rejected') THEN 1 ELSE 0 END) AS reviewedCount,
+               SUM(CASE WHEN e.review_status = 'passed' THEN 1 ELSE 0 END) AS passedCount,
+               SUM(CASE WHEN e.review_status IN ('rejected', 're_rejected') THEN 1 ELSE 0 END) AS rejectedCount,
+               SUM(CASE WHEN e.review_status = 'passed' AND COALESCE(e.reject_count, 0) = 0 THEN 1 ELSE 0 END) AS firstPassCount,
+               COALESCE(SUM(e.reject_count), 0) AS reworkCount
+        FROM label_entry_node n
+        INNER JOIN label_task t ON t.id = n.task_id AND t.deleted = 0
+        INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        INNER JOIN label_data_entry e ON e.id = n.entry_id AND e.deleted = 0
+        LEFT JOIN sys_user u ON u.user_id = n.operator_id
+        WHERE n.deleted = 0
+          AND n.status = 'done'
+          AND n.node_type = 'label'
+          AND n.operator_id IS NOT NULL
+          AND n.done_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.done_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+        <include refid="entryScope"/>
+        GROUP BY n.operator_id, u.nick_name, u.user_name
+        ORDER BY firstPassCount DESC
+        <if test="q.limit != null"> LIMIT #{q.limit} </if>
+    </select>
+
+    <!-- ============================ 筛选项 ============================ -->
+
+    <select id="selectNodeOptions" resultType="org.dromara.label.vo.StatsNodeOptionVO">
+        SELECT wn.node_key AS nodeKey,
+               MIN(wn.node_name) AS nodeName,
+               MIN(wn.node_type) AS nodeType
+        FROM label_workflow_node wn
+        INNER JOIN label_project p ON p.id = wn.project_id AND p.deleted = 0
+        WHERE wn.deleted = 0
+        <if test="q.projectId != null"> AND p.id = #{q.projectId} </if>
+        <if test="q.teamId != null">
+            AND (p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        GROUP BY wn.node_key
+        ORDER BY MIN(wn.sort_order) ASC
+    </select>
+
+    <select id="selectTeamOptions" resultType="org.dromara.label.vo.StatsOptionVO">
+        SELECT id AS id, team_name AS name
+        FROM label_team
+        WHERE deleted = 0
+        ORDER BY team_name ASC
+    </select>
+
+    <!-- 项目下拉恒定列出全部可选项目：不按当前选中的 projectId 自过滤，
+         否则选中后再次 loadFilters 时下拉只剩自身，无法切换/取消项目；仅按团队联动过滤。 -->
+    <select id="selectProjectOptions" resultType="org.dromara.label.vo.StatsOptionVO">
+        SELECT p.id AS id, p.project_name AS name
+        FROM label_project p
+        WHERE p.deleted = 0
+        <if test="q.teamId != null">
+            AND (p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        ORDER BY p.create_time DESC
+    </select>
+
+    <select id="selectTaskOptions" resultType="org.dromara.label.vo.StatsOptionVO">
+        SELECT t.id AS id, t.task_name AS name
+        FROM label_task t
+        INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        WHERE t.deleted = 0
+        <if test="q.projectId != null"> AND p.id = #{q.projectId} </if>
+        <if test="q.teamId != null">
+            AND (t.team_id = #{q.teamId} OR p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        ORDER BY t.create_time DESC
+        LIMIT 200
+    </select>
+
+    <select id="selectMemberOptions" resultType="org.dromara.label.vo.StatsOptionVO">
+        SELECT DISTINCT n.operator_id AS id,
+               <include refid="memberName"/> AS name
+        <include refid="entryFrom"/>
+        WHERE n.deleted = 0
+          AND n.operator_id IS NOT NULL
+          AND n.update_time &gt;= CONCAT(#{q.startDate}, ' 00:00:00')
+          AND n.update_time &lt;= CONCAT(#{q.endDate}, ' 23:59:59')
+        <include refid="entryScope"/>
+        ORDER BY name ASC
+        LIMIT 500
+    </select>
+
+    <select id="selectEntryOptions" resultType="org.dromara.label.vo.StatsOptionVO">
+        SELECT e.id AS id,
+               COALESCE(NULLIF(e.entry_name, ''), CONCAT('条目#', e.id)) AS name
+        FROM label_data_entry e
+        INNER JOIN label_task t ON t.id = e.task_id AND t.deleted = 0
+        INNER JOIN label_project p ON p.id = t.project_id AND p.deleted = 0
+        WHERE e.deleted = 0
+        <if test="q.projectId != null"> AND p.id = #{q.projectId} </if>
+        <if test="q.taskId != null"> AND t.id = #{q.taskId} </if>
+        <if test="q.teamId != null">
+            AND (t.team_id = #{q.teamId} OR p.team_id = #{q.teamId}
+            OR EXISTS (SELECT 1 FROM label_project_team pt
+                       WHERE pt.project_id = p.id AND pt.team_id = #{q.teamId} AND pt.deleted = 0))
+        </if>
+        ORDER BY e.id DESC
+        LIMIT 500
+    </select>
+
+    <select id="selectBatchOptions" resultType="org.dromara.label.vo.StatsOptionVO">
+        SELECT b.id AS id,
+               COALESCE(NULLIF(b.batch_name, ''), b.batch_no, CONCAT('批次#', b.id)) AS name
+        FROM label_asset_batch b
+        WHERE b.deleted = 0
+        <if test="q.projectId != null"> AND b.project_id = #{q.projectId} </if>
+        ORDER BY b.id DESC
+        LIMIT 500
+    </select>
+
+    <!-- ============================ 工时心跳 ============================ -->
+
+    <insert id="upsertWorkSession">
+        INSERT INTO label_work_session
+            (user_id, project_id, task_id, node_key, work_date, active_seconds, last_heartbeat_time)
+        VALUES
+            (#{userId}, #{dto.projectId}, COALESCE(#{dto.taskId}, 0), COALESCE(#{dto.nodeKey}, 'label'),
+             #{workDate}, #{seconds}, NOW())
+        ON DUPLICATE KEY UPDATE
+            active_seconds = active_seconds + VALUES(active_seconds),
+            project_id = COALESCE(VALUES(project_id), project_id),
+            last_heartbeat_time = NOW(),
+            update_time = NOW()
+    </insert>
+
+    <select id="selectWorkSessionSeconds" resultType="java.lang.Long">
+        SELECT COALESCE(SUM(active_seconds), 0)
+        FROM label_work_session
+        WHERE deleted = 0
+          AND user_id = #{userId}
+          AND task_id = #{taskId}
+          AND node_key = #{nodeKey}
+          AND work_date = #{workDate}
+    </select>
+
+</mapper>

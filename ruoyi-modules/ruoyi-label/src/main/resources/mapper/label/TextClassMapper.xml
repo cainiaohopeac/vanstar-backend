@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.TextClassMapper">
+
+    <!-- ============ 标签集 ============ -->
+
+    <select id="selectClassSets" resultType="org.dromara.label.entity.LabelTextClassSet">
+        SELECT id, project_id AS projectId, set_name AS setName, description, status
+        FROM label_text_class_set
+        WHERE project_id = #{projectId} AND deleted = 0
+        ORDER BY id
+    </select>
+
+    <insert id="insertClassSet" parameterType="org.dromara.label.entity.LabelTextClassSet"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_text_class_set (
+            project_id, set_name, description, status, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{setName}, #{description}, #{status}, #{createBy}, #{updateBy}
+        )
+    </insert>
+
+    <update id="updateClassSet" parameterType="org.dromara.label.entity.LabelTextClassSet">
+        UPDATE label_text_class_set
+        SET set_name = #{setName},
+            description = #{description},
+            status = #{status},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <!-- ============ 标签 ============ -->
+
+    <!-- 按项目平铺查出全部层级，由调用方组装成树：
+         一次查询 + 内存建树，比按层递归查询（每层一次往返）快得多。 -->
+    <select id="selectClasses" resultType="org.dromara.label.entity.LabelTextClass">
+        SELECT id, project_id AS projectId, class_set_id AS classSetId, parent_id AS parentId,
+               node_type AS nodeType, label_name AS labelName, color, sort_order AS sortOrder, status
+        FROM label_text_class
+        WHERE project_id = #{projectId} AND deleted = 0
+        ORDER BY sort_order, id
+    </select>
+
+    <select id="selectClass" resultType="org.dromara.label.entity.LabelTextClass">
+        SELECT id, project_id AS projectId, class_set_id AS classSetId, parent_id AS parentId,
+               node_type AS nodeType, label_name AS labelName, color, sort_order AS sortOrder, status
+        FROM label_text_class
+        WHERE id = #{id} AND deleted = 0
+    </select>
+
+    <insert id="insertClass" parameterType="org.dromara.label.entity.LabelTextClass"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_text_class (
+            project_id, class_set_id, parent_id, node_type, label_name, color, sort_order, status,
+            created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{classSetId}, #{parentId}, #{nodeType}, #{labelName}, #{color},
+            #{sortOrder}, #{status}, #{createBy}, #{updateBy}
+        )
+    </insert>
+
+    <update id="updateClass" parameterType="org.dromara.label.entity.LabelTextClass">
+        UPDATE label_text_class
+        SET class_set_id = #{classSetId},
+            parent_id = #{parentId},
+            node_type = #{nodeType},
+            label_name = #{labelName},
+            color = #{color},
+            sort_order = #{sortOrder},
+            status = #{status},
+            updated_by = #{updateBy},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <select id="countEntityUsage" resultType="long">
+        SELECT COUNT(1)
+        FROM label_text_entity
+        WHERE class_id = #{classId} AND deleted = 0
+    </select>
+
+    <update id="softDeleteClass">
+        UPDATE label_text_class
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+</mapper>

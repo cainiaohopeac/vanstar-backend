@@ -1,0 +1,1579 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.TaskMapper">
+
+    <sql id="taskListColumns">
+        t.id,
+        t.task_no AS taskNo,
+        t.task_name AS taskName,
+        p.id AS projectId,
+        p.project_code AS projectCode,
+        p.project_name AS projectName,
+        t.data_type AS dataType,
+        COALESCE(u.nick_name, u.user_name, '未知') AS creatorName,
+        COALESCE(team.team_name, '未分组') AS teamName,
+        t.asset_count AS assetCount,
+        t.completed_count AS completedCount,
+        t.status
+    </sql>
+
+    <select id="selectTasks" resultType="org.dromara.label.vo.TaskVO">
+        SELECT <include refid="taskListColumns"/>
+        FROM label_task t
+        JOIN label_project p ON p.id = t.project_id
+        LEFT JOIN sys_user u ON u.user_id = t.creator_id
+        LEFT JOIN label_team team ON team.id = t.team_id
+        <where>
+            t.deleted = 0
+            <if test="taskNo != null and taskNo != ''">
+                AND t.task_no LIKE CONCAT('%', #{taskNo}, '%')
+            </if>
+            <if test="taskName != null and taskName != ''">
+                AND t.task_name LIKE CONCAT('%', #{taskName}, '%')
+            </if>
+            <if test="projectName != null and projectName != ''">
+                AND p.project_name LIKE CONCAT('%', #{projectName}, '%')
+            </if>
+            <if test="status != null and status != ''">
+                AND t.status = #{status}
+            </if>
+            <if test="teamName != null and teamName != ''">
+                AND team.team_name = #{teamName}
+            </if>
+            <!-- 任务管理：谁创建的谁可见 -->
+            <if test="creatorId != null">
+                AND t.creator_id = #{creatorId}
+            </if>
+            <!--
+              数据任务列表可见范围：
+              下发给本人负责团队的任务（teamIds）与本人已被配置为任务成员的任务（memberUserId）取并集，
+              使普通标注员在「成员配置」被加入任务后即可在列表中看到该任务。
+            -->
+            <if test="(teamIds != null and teamIds.size() > 0) or memberUserId != null">
+                AND (
+                <trim prefixOverrides="OR">
+                    <if test="teamIds != null and teamIds.size() > 0">
+                        OR EXISTS(SELECT 1 FROM label_task_team tt
+                                  WHERE tt.task_id = t.id AND tt.deleted = 0
+                                    AND tt.team_id IN
+                                    <foreach collection="teamIds" item="tid" open="(" separator="," close=")">
+                                        #{tid}
+                                    </foreach>)
+                    </if>
+                    <if test="memberUserId != null">
+                        OR EXISTS(SELECT 1 FROM label_task_member lm
+                                  WHERE lm.task_id = t.id AND lm.deleted = 0
+                                    AND lm.user_id = #{memberUserId})
+                    </if>
+                </trim>
+                )
+            </if>
+        </where>
+        ORDER BY t.update_time DESC, t.id DESC
+    </select>
+
+    <!-- ============ 团队负责人范围 ============ -->
+
+    <select id="selectLeaderTeamIds" resultType="long">
+        SELECT DISTINCT tm.id
+        FROM label_team tm
+        LEFT JOIN label_team_member m
+               ON m.team_id = tm.id AND m.user_id = #{userId}
+              AND m.team_role = 'leader' AND m.deleted = 0
+        WHERE tm.deleted = 0
+          AND (tm.leader_id = #{userId} OR m.id IS NOT NULL)
+    </select>
+
+    <select id="selectLeaderTeamNames" resultType="string">
+        SELECT DISTINCT tm.team_name
+        FROM label_team tm
+        LEFT JOIN label_team_member m
+               ON m.team_id = tm.id AND m.user_id = #{userId}
+              AND m.team_role = 'leader' AND m.deleted = 0
+        WHERE tm.deleted = 0
+          AND (tm.leader_id = #{userId} OR m.id IS NOT NULL)
+        ORDER BY tm.team_name
+    </select>
+
+    <select id="countTaskTeamLeader" resultType="int">
+        SELECT COUNT(*)
+        FROM label_task_team tt
+        JOIN label_team tm ON tm.id = tt.team_id AND tm.deleted = 0
+        LEFT JOIN label_team_member m
+               ON m.team_id = tt.team_id AND m.user_id = #{userId}
+              AND m.team_role = 'leader' AND m.deleted = 0
+        WHERE tt.task_id = #{taskId} AND tt.deleted = 0
+          AND (tm.leader_id = #{userId} OR m.id IS NOT NULL)
+    </select>
+
+    <sql id="taskDetailColumns">
+        SELECT t.id, t.task_no AS taskNo, t.task_name AS taskName,
+               p.id AS projectId, p.project_code AS projectCode, p.project_name AS projectName,
+               COALESCE(team.team_name, '未分组') AS teamName,
+               t.data_type AS dataType, t.status, t.asset_count AS assetCount,
+               t.completed_count AS completedCount,
+               t.pre_annotation_enabled AS preAnnotationEnabled,
+               t.current_node_key AS currentNodeKey
+        FROM label_task t
+        JOIN label_project p ON p.id = t.project_id
+        LEFT JOIN label_team team ON team.id = t.team_id
+        WHERE t.deleted = 0
+    </sql>
+
+    <select id="selectTask" resultType="org.dromara.label.vo.TaskVO">
+        <include refid="taskDetailColumns"/>
+        AND t.id = #{id}
+    </select>
+
+    <select id="selectTaskProjectId" resultType="long">
+        SELECT project_id FROM label_task WHERE id = #{id}
+    </select>
+
+    <select id="selectTaskDataType" resultType="string">
+        SELECT data_type FROM label_task WHERE id = #{id}
+    </select>
+
+    <select id="selectTaskPreAnnotationEnabled" resultType="java.lang.Integer">
+        SELECT pre_annotation_enabled FROM label_task WHERE deleted = 0 AND id = #{taskId}
+    </select>
+
+    <select id="selectLatestBatchId" resultType="long">
+        SELECT id FROM label_asset_batch
+        WHERE project_id = #{projectId} AND deleted = 0
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <!-- ============ 任务下发范围（团队/批次 多对多） ============ -->
+
+    <delete id="deleteTaskTeams">
+        DELETE FROM label_task_team WHERE task_id = #{taskId}
+    </delete>
+
+    <insert id="insertTaskTeam">
+        INSERT INTO label_task_team (task_id, team_id, created_by, updated_by)
+        VALUES (#{taskId}, #{teamId}, #{userId}, #{userId})
+    </insert>
+
+    <select id="selectTaskTeamIds" resultType="long">
+        SELECT team_id FROM label_task_team
+        WHERE task_id = #{taskId} AND deleted = 0
+        ORDER BY team_id
+    </select>
+
+    <select id="selectTaskTeams" resultType="map">
+        SELECT tt.task_id AS taskId,
+               tt.team_id AS teamId,
+               team.team_name AS teamName
+        FROM label_task_team tt
+        JOIN label_team team ON team.id = tt.team_id AND team.deleted = 0
+        WHERE tt.deleted = 0 AND tt.task_id IN
+        <foreach collection="ids" item="tid" open="(" separator="," close=")">
+            #{tid}
+        </foreach>
+        ORDER BY tt.task_id, team.id
+    </select>
+
+    <delete id="deleteTaskBatches">
+        DELETE FROM label_task_batch WHERE task_id = #{taskId}
+    </delete>
+
+    <insert id="insertTaskBatch">
+        INSERT INTO label_task_batch (task_id, batch_id, created_by, updated_by)
+        VALUES (#{taskId}, #{batchId}, #{userId}, #{userId})
+    </insert>
+    <!-- 批量下发批次：一条 INSERT 写入全部关联，替代逐条 insert 的 N 次往返 -->
+    <insert id="insertTaskBatches">
+        INSERT INTO label_task_batch (task_id, batch_id, created_by, updated_by)
+        VALUES
+        <foreach collection="batchIds" item="batchId" separator=",">
+            (#{taskId}, #{batchId}, #{userId}, #{userId})
+        </foreach>
+    </insert>
+
+    <!-- 批次调整时只删被移出的关联，避免「全删再全插」的无效写入 -->
+    <delete id="deleteTaskBatchesByIds">
+        DELETE FROM label_task_batch
+        WHERE task_id = #{taskId} AND batch_id IN
+        <foreach collection="batchIds" item="batchId" open="(" separator="," close=")">
+            #{batchId}
+        </foreach>
+    </delete>
+
+    <select id="selectTaskBatchIds" resultType="long">
+        SELECT batch_id FROM label_task_batch
+        WHERE task_id = #{taskId} AND deleted = 0
+        ORDER BY id
+    </select>
+
+    <!-- 任务可追加的批次：同项目下、未下发到任何任务、且尚未在本任务中的批次 -->
+    <select id="selectAppendableBatches" resultType="org.dromara.label.vo.AssetBatchVO">
+        SELECT b.id,
+               b.batch_no AS batchNo,
+               COALESCE(b.batch_name, b.batch_no) AS batchName,
+               b.remark,
+               (SELECT COUNT(*) FROM label_data_entry e WHERE e.batch_id = b.id AND e.deleted = 0) AS entryCount,
+               (SELECT COUNT(*) FROM label_asset a
+                JOIN label_data_entry e ON e.id = a.entry_id AND e.deleted = 0
+                WHERE a.batch_id = b.id AND a.deleted = 0) AS assetCount
+        FROM label_asset_batch b
+        WHERE b.deleted = 0
+          AND b.project_id = #{projectId}
+          AND b.id NOT IN (SELECT tb.batch_id FROM label_task_batch tb WHERE tb.deleted = 0 AND tb.task_id = #{taskId})
+          AND b.id NOT IN (SELECT tb.batch_id FROM label_task_batch tb WHERE tb.deleted = 0 AND tb.task_id &lt;&gt; #{taskId})
+        ORDER BY b.id DESC
+    </select>
+
+    <update id="updateTaskAssetCount">
+        UPDATE label_task
+        SET asset_count = #{assetCount}, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{taskId}
+    </update>
+
+    <select id="selectTaskBatches" resultType="map">
+        SELECT tb.task_id AS taskId,
+               tb.batch_id AS batchId,
+               COALESCE(b.batch_name, b.batch_no) AS batchName
+        FROM label_task_batch tb
+        JOIN label_asset_batch b ON b.id = tb.batch_id AND b.deleted = 0
+        WHERE tb.deleted = 0 AND tb.task_id IN
+        <foreach collection="ids" item="tid" open="(" separator="," close=")">
+            #{tid}
+        </foreach>
+        ORDER BY tb.task_id, b.id
+    </select>
+
+    <!-- ============ 批次下发占用（同一批次只允许下发一次） ============ -->
+
+    <sql id="batchOccupancyColumns">
+        tb.batch_id AS batchId,
+        COALESCE(b.batch_name, b.batch_no) AS batchName,
+        tb.task_id AS taskId,
+        t.task_no AS taskNo,
+        t.task_name AS taskName
+    </sql>
+
+    <select id="selectBatchOccupancy" resultType="org.dromara.label.vo.BatchOccupancyVO">
+        SELECT <include refid="batchOccupancyColumns"/>
+        FROM label_task_batch tb
+        JOIN label_task t ON t.id = tb.task_id AND t.deleted = 0
+        LEFT JOIN label_asset_batch b ON b.id = tb.batch_id AND b.deleted = 0
+        WHERE tb.deleted = 0 AND t.project_id = #{projectId}
+        ORDER BY tb.batch_id, tb.task_id
+    </select>
+
+    <select id="selectOccupiedBatches" resultType="org.dromara.label.vo.BatchOccupancyVO">
+        SELECT <include refid="batchOccupancyColumns"/>
+        FROM label_task_batch tb
+        JOIN label_task t ON t.id = tb.task_id AND t.deleted = 0
+        LEFT JOIN label_asset_batch b ON b.id = tb.batch_id AND b.deleted = 0
+        WHERE tb.deleted = 0 AND tb.batch_id IN
+        <foreach collection="batchIds" item="batchId" open="(" separator="," close=")">
+            #{batchId}
+        </foreach>
+        <if test="excludeTaskId != null">
+            AND tb.task_id &lt;&gt; #{excludeTaskId}
+        </if>
+        ORDER BY tb.batch_id, tb.task_id
+    </select>
+
+    <select id="countJobsByTask" resultType="int">
+        SELECT COUNT(*) FROM label_job WHERE task_id = #{taskId} AND deleted = 0
+    </select>
+
+    <select id="countAssetsByProjectAndType" resultType="int">
+        SELECT COUNT(*) FROM label_asset
+        WHERE project_id = #{projectId} AND media_type = #{mediaType} AND deleted = 0
+    </select>
+
+    <select id="countAssetsByBatchAndType" resultType="int">
+        SELECT COUNT(*) FROM label_asset
+        WHERE batch_id = #{batchId} AND media_type = #{mediaType} AND deleted = 0
+    </select>
+
+    <select id="countAssetsByBatches" resultType="int">
+        SELECT COUNT(*) FROM label_asset
+        WHERE deleted = 0 AND batch_id IN
+        <foreach collection="batchIds" item="batchId" open="(" separator="," close=")">
+            #{batchId}
+        </foreach>
+    </select>
+
+    <insert id="insertTask" parameterType="org.dromara.label.entity.LabelTask" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_task (
+            project_id, class_set_id, task_no, task_name, data_type, creator_id, team_id,
+            status, job_size, total_job_count, asset_count, completed_count, pre_annotation_enabled, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{classSetId}, #{taskNo}, #{taskName}, #{dataType}, #{creatorId}, #{teamId},
+            'pending_assign', 100, 0, #{assetCount}, 0, #{preAnnotationEnabled}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="updateTask" parameterType="org.dromara.label.entity.LabelTask">
+        UPDATE label_task
+        SET project_id = #{projectId}, class_set_id = #{classSetId}, task_name = #{taskName},
+            data_type = #{dataType}, team_id = #{teamId}, asset_count = #{assetCount},
+            pre_annotation_enabled = #{preAnnotationEnabled},
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateTaskStatus">
+        UPDATE label_task
+        SET status = #{status}, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{taskId}
+    </update>
+
+    <update id="updateTaskAfterSplit">
+        UPDATE label_task
+        SET total_job_count = #{jobCount}, status = 'pending_assign',
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{taskId}
+    </update>
+
+    <!-- ============ 作业 ============ -->
+
+    <sql id="jobColumns">
+        j.id,
+        j.task_id AS taskId,
+        j.project_id AS projectId,
+        j.job_no AS jobNo,
+        p.project_name AS projectName,
+        t.task_name AS taskName,
+        j.batch_id AS batchId,
+        b.batch_name AS batchName,
+        j.data_type AS dataType,
+        j.assignee_id AS assigneeId,
+        j.reviewer_id AS reviewerId,
+        COALESCE(assignee.nick_name, assignee.user_name, '未分配') AS assigneeName,
+        COALESCE(reviewer.nick_name, reviewer.user_name, '未分配') AS reviewerName,
+        j.asset_count AS assetCount,
+        j.progress,
+        j.reject_count AS rejectCount,
+        j.status
+    </sql>
+
+    <select id="selectJobs" resultType="org.dromara.label.vo.JobVO">
+        SELECT <include refid="jobColumns"/>
+        FROM label_job j
+        JOIN label_task t ON t.id = j.task_id
+        JOIN label_project p ON p.id = j.project_id
+        LEFT JOIN sys_user assignee ON assignee.user_id = j.assignee_id
+        LEFT JOIN sys_user reviewer ON reviewer.user_id = j.reviewer_id
+        LEFT JOIN label_asset_batch b ON b.id = j.batch_id
+        <where>
+            j.deleted = 0
+            <if test="taskId != null">
+                AND j.task_id = #{taskId}
+            </if>
+        </where>
+        ORDER BY j.id DESC
+    </select>
+
+    <select id="selectJob" resultType="org.dromara.label.vo.JobVO">
+        SELECT <include refid="jobColumns"/>
+        FROM label_job j
+        JOIN label_task t ON t.id = j.task_id
+        JOIN label_project p ON p.id = j.project_id
+        LEFT JOIN sys_user assignee ON assignee.user_id = j.assignee_id
+        LEFT JOIN sys_user reviewer ON reviewer.user_id = j.reviewer_id
+        LEFT JOIN label_asset_batch b ON b.id = j.batch_id
+        WHERE j.deleted = 0 AND j.id = #{id}
+    </select>
+
+    <select id="selectJobTaskId" resultType="long">
+        SELECT task_id FROM label_job WHERE id = #{id}
+    </select>
+
+    <!--
+      按处理人 + 状态集合过滤作业：标注工作台「我的作业」（myJobs）/ 审核工作台「审核列表」
+      （reviews）专用，把原 selectJobs(null) 全量 JOIN 加载 + Java stream 内存过滤下推到 SQL，
+      避免并发场景全表加载。assigneeId 非空时按标注员过滤；statuses 为业务放行状态集合；
+      status 为前端点选的精确状态（可空，空则不追加）。索引见 label_job_index_upgrade.sql。
+    -->
+    <select id="selectJobsByFilter" resultType="org.dromara.label.vo.JobVO">
+        SELECT <include refid="jobColumns"/>
+        FROM label_job j
+        JOIN label_task t ON t.id = j.task_id
+        JOIN label_project p ON p.id = j.project_id
+        LEFT JOIN sys_user assignee ON assignee.user_id = j.assignee_id
+        LEFT JOIN sys_user reviewer ON reviewer.user_id = j.reviewer_id
+        LEFT JOIN label_asset_batch b ON b.id = j.batch_id
+        <where>
+            j.deleted = 0
+            <if test="assigneeId != null">
+                AND j.assignee_id = #{assigneeId}
+            </if>
+            <if test="statuses != null and statuses.size() > 0">
+                AND j.status IN
+                <foreach collection="statuses" item="s" open="(" separator="," close=")">#{s}</foreach>
+            </if>
+            <if test="status != null and status != ''">
+                AND j.status = #{status}
+            </if>
+        </where>
+        ORDER BY j.id DESC
+    </select>
+
+    <select id="selectJobStatuses" resultType="string">
+        SELECT status FROM label_job WHERE task_id = #{taskId} AND deleted = 0
+    </select>
+
+    <insert id="insertJob" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_job (
+            task_id, project_id, batch_id, job_no, data_type, assignee_id, reviewer_id,
+            status, qc_status, asset_count, progress, created_by, updated_by
+        ) VALUES (
+            #{taskId}, #{projectId}, #{batchId}, #{jobNo}, #{dataType}, NULL, NULL,
+            'pending_assign', 'waiting', #{assetCount}, 0, #{userId}, #{userId}
+        )
+    </insert>
+
+    <insert id="insertJobAssets">
+        INSERT IGNORE INTO label_job_asset (job_id, asset_id, sort_order)
+        SELECT #{jobId}, a.id, ROW_NUMBER() OVER (ORDER BY a.id)
+        FROM label_asset a
+        WHERE a.project_id = #{projectId} AND a.media_type = #{mediaType} AND a.deleted = 0
+    </insert>
+
+    <insert id="insertJobAssetsByBatch">
+        INSERT IGNORE INTO label_job_asset (job_id, asset_id, sort_order)
+        SELECT #{jobId}, a.id, ROW_NUMBER() OVER (ORDER BY a.id)
+        FROM label_asset a
+        WHERE a.batch_id = #{batchId} AND a.media_type = #{mediaType} AND a.deleted = 0
+    </insert>
+
+    <update id="updateJobAssignee">
+        UPDATE label_job
+        SET assignee_id = #{assigneeId}, reviewer_id = #{reviewerId}, status = 'pending_label',
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateJobStatus">
+        UPDATE label_job
+        SET status = #{status}, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <!-- ============ 任务数据条目（条目级分配） ============ -->
+
+    <select id="selectTaskBatchesWithCount" resultType="org.dromara.label.vo.AssetBatchVO">
+        SELECT b.id,
+               b.project_id AS projectId,
+               b.batch_no AS batchNo,
+               b.batch_name AS batchName,
+               b.remark,
+               b.source_type AS sourceType,
+               b.status,
+               b.create_time AS createTime,
+               (SELECT COUNT(*) FROM label_asset a
+                 WHERE a.batch_id = b.id AND a.deleted = 0
+                 <include refid="teamScopeFilter"/>) AS assetCount,
+               (SELECT COUNT(*) FROM label_data_entry e
+                 WHERE e.batch_id = b.id AND e.deleted = 0
+                 <include refid="teamScopeFilterEntry"/>) AS entryCount,
+               (SELECT COUNT(*) FROM label_data_entry e
+                 WHERE e.batch_id = b.id AND e.deleted = 0
+                   AND e.assignee_id IS NULL AND e.label_status = 'pending'
+                 <include refid="teamScopeFilterEntry"/>) AS pendingCount
+        FROM label_task_batch tb
+        JOIN label_asset_batch b ON b.id = tb.batch_id AND b.deleted = 0
+        WHERE tb.task_id = #{taskId} AND tb.deleted = 0
+        ORDER BY b.id
+    </select>
+
+    <!--
+      任务条目范围（条目 = 数据集合包 label_data_entry）：
+      task_id 是条目归属任务的唯一依据，由 TaskServiceImpl#syncTaskBatches 在批次下发 /
+      移出时维护（bindEntriesToTask / unbindEntriesFromTask），查询侧只做等值匹配以命中
+      idx_entry_task。要求外层传入 taskId 参数。
+    -->
+    <sql id="entryScope">
+        e.deleted = 0
+        AND e.task_id = #{taskId}
+    </sql>
+
+    <!--
+      「我的团队」范围（数据任务列表详情用，别名固定为 a）：
+      仅本团队成员已认领的条目 + 尚未分配（可被领取）的条目；
+      scopeUserIds 为 null 时不做限制（团队负责人 / 任务管理员看任务池全部数据）；
+      mineUserId 非空时仅看本人已领取的条目（普通成员视角）。
+    -->
+    <sql id="teamScopeFilter">
+        <if test="mineUserId != null">
+            AND a.assignee_id = #{mineUserId}
+        </if>
+        <if test="mineUserId == null and scopeUserIds != null">
+            AND (a.assignee_id IS NULL
+            <if test="scopeUserIds.size() > 0">
+                OR a.assignee_id IN
+                <foreach collection="scopeUserIds" item="uid" open="(" separator="," close=")">
+                    #{uid}
+                </foreach>
+            </if>
+            )
+        </if>
+    </sql>
+
+    <!--
+      「我的团队」范围（数据条目维度，别名固定为 e）：
+      本团队成员已认领的条目 + 尚未分配（可被领取）的条目 + 已放弃的条目
+      （已放弃条目对团队全体成员可见，便于了解进度，但仅放弃人可恢复）；
+      mineUserId 非空时仅看本人已领取的条目（普通成员视角，放弃时 assignee 保留故仍可见可恢复）。
+    -->
+    <sql id="teamScopeFilterEntry">
+        <if test="mineUserId != null">
+            AND e.assignee_id = #{mineUserId}
+        </if>
+        <if test="mineUserId == null and scopeUserIds != null">
+            AND (e.assignee_id IS NULL
+            OR e.label_status = 'abandoned'
+            <if test="scopeUserIds.size() > 0">
+                OR e.assignee_id IN
+                <foreach collection="scopeUserIds" item="uid" open="(" separator="," close=")">
+                    #{uid}
+                </foreach>
+            </if>
+            )
+        </if>
+    </sql>
+
+    <sql id="entryFilters">
+        <if test="batchId != null">
+            AND e.batch_id = #{batchId}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND (e.entry_name LIKE CONCAT('%', #{keyword}, '%')
+                 OR e.entry_no LIKE CONCAT('%', #{keyword}, '%')
+                 OR u.file_name LIKE CONCAT('%', #{keyword}, '%'))
+        </if>
+        <if test="tab != null and tab != ''">
+            <choose>
+                <!-- 待办项：已领取待处理（标注中/修订中），无人领取时为空；
+                     与节点视图 nodeEntryFilters 的 claimed 分支（n.status='claimed'）口径一致，
+                     负责人/管理员无 scope 限制时展示团队全部已领取条目，普通成员 scope=mine 只看本人 -->
+                <when test="tab == 'claimed'">AND e.label_status IN ('labeling', 'revising')</when>
+                <!-- 待领取池（历史页签）：待分配 + 审核驳回待修订（未修订/修订中/已修订），原「未修订」页签已并入 -->
+                <when test="tab == 'pending'">AND e.label_status IN ('pending', 'unrevised', 'revising', 'revised')</when>
+                <when test="tab == 'labeling'">AND e.label_status = 'labeling'</when>
+                <when test="tab == 'labeled'">AND e.label_status = 'labeled'</when>
+                <when test="tab == 'skipped'">AND e.label_status = 'skipped'</when>
+                <when test="tab == 'abandoned'">AND e.label_status = 'abandoned'</when>
+                <when test="tab == 'unrevised'">AND e.label_status IN ('unrevised', 'revising', 'revised')</when>
+                <when test="tab == 'passed'">AND e.review_status = 'passed'</when>
+            </choose>
+        </if>
+        <!-- 总览（无 tab）：只看「当前节点」仍停留在标注节点的条目，与列表「当前节点」列口径一致 -->
+        <if test="tab == null or tab == ''">
+            AND <include refid="currentNodeAtLabel"/>
+        </if>
+        <include refid="teamScopeFilterEntry"/>
+    </sql>
+
+    <!--
+      「当前节点」= 标注节点 判定（与 TaskServiceImpl#fillCurrentNodes 口径一致）：
+      未提交（待领取/标注中/驳回修订中/已跳过/已放弃）仍在标注节点；
+      已提交且本级未通过、且无任何领取中(claimed)/待领取(pending)节点记录时，兜底任务当前节点；
+      已通过的条目不属于任何节点。依赖外层别名 e（label_data_entry）与 t（label_task）。
+    -->
+    <sql id="currentNodeAtLabel">
+        (
+            e.label_status NOT IN ('labeled', 'revised')
+            OR (
+                e.label_status IN ('labeled', 'revised')
+                AND (e.review_status IS NULL OR e.review_status != 'passed')
+                AND NOT EXISTS (SELECT 1 FROM label_entry_node c
+                                WHERE c.entry_id = e.id AND c.deleted = 0 AND c.status = 'claimed')
+                AND NOT EXISTS (SELECT 1 FROM label_entry_node p
+                                WHERE p.entry_id = e.id AND p.deleted = 0 AND p.status = 'pending')
+                AND t.current_node_key = 'label'
+            )
+        )
+    </sql>
+
+    <!--
+      「当前节点」= 指定节点(#{nodeKey}) 判定（与 TaskServiceImpl#fillCurrentNodes 口径一致）：
+      已提交且本级未通过；有领取中(claimed)记录时当前节点即领取节点，
+      否则取最靠前的待领取(pending)节点（按工作流节点排序号比较），
+      均无记录时兜底任务当前节点；已通过的条目不属于任何节点。
+      依赖外层别名 e、t。
+    -->
+    <sql id="currentNodeAtNode">
+        (
+            e.label_status IN ('labeled', 'revised')
+            AND (e.review_status IS NULL OR e.review_status != 'passed')
+            AND (
+                EXISTS (SELECT 1 FROM label_entry_node c
+                        WHERE c.entry_id = e.id AND c.deleted = 0
+                          AND c.status = 'claimed'
+                          AND c.node_key COLLATE utf8mb4_general_ci = #{nodeKey})
+                OR (
+                    NOT EXISTS (SELECT 1 FROM label_entry_node c2
+                                WHERE c2.entry_id = e.id AND c2.deleted = 0 AND c2.status = 'claimed')
+                    AND EXISTS (SELECT 1 FROM label_entry_node p
+                                WHERE p.entry_id = e.id AND p.deleted = 0
+                                  AND p.status = 'pending'
+                                  AND p.node_key COLLATE utf8mb4_general_ci = #{nodeKey})
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM label_entry_node p3
+                                 JOIN label_workflow_node w3
+                                      ON w3.project_id = t.project_id AND w3.deleted = 0
+                                          AND w3.node_key COLLATE utf8mb4_general_ci = p3.node_key
+                        WHERE p3.entry_id = e.id AND p3.deleted = 0 AND p3.status = 'pending'
+                          AND IFNULL(w3.sort_order, 0) &lt;
+                              (SELECT IFNULL(w4.sort_order, 0) FROM label_workflow_node w4
+                               WHERE w4.project_id = t.project_id AND w4.deleted = 0
+                                 AND w4.node_key COLLATE utf8mb4_general_ci = #{nodeKey}))
+                )
+                OR (
+                    NOT EXISTS (SELECT 1 FROM label_entry_node c3
+                                WHERE c3.entry_id = e.id AND c3.deleted = 0
+                                  AND c3.status IN ('claimed', 'pending'))
+                    AND t.current_node_key COLLATE utf8mb4_general_ci = #{nodeKey}
+                )
+            )
+        )
+    </sql>
+
+    <sql id="entryFrom">
+        FROM label_data_entry e
+        JOIN label_task t ON t.id = #{taskId}
+        LEFT JOIN label_upload u ON u.id = e.upload_id
+        LEFT JOIN label_asset_batch b ON b.id = e.batch_id
+        LEFT JOIN label_project p ON p.id = t.project_id
+        LEFT JOIN sys_user sa ON sa.user_id = e.assignee_id
+        LEFT JOIN sys_user sr ON sr.user_id = e.reviewer_id
+        <!-- 首个资产：fileUrl/thumbnailUrl 走 first_asset_id 主键 JOIN（一对零/一，不改变 countEntries 计数） -->
+        LEFT JOIN label_asset fa ON fa.id = e.first_asset_id AND fa.deleted = 0
+    </sql>
+
+    <sql id="entryColumns">
+        e.id,
+        e.entry_no AS entryNo,
+        e.entry_name AS entryName,
+        e.source_file AS sourceFile,
+        e.entry_name AS fileName,
+        e.asset_count AS assetCount,
+        u.file_name AS uploadName,
+        fa.file_url AS fileUrl,
+        fa.thumbnail_url AS thumbnailUrl,
+        e.batch_id AS batchId,
+        COALESCE(b.batch_name, b.batch_no) AS batchName,
+        e.media_type AS mediaType,
+        e.parse_status AS parseStatus,
+        e.label_status AS labelStatus,
+        e.review_status AS reviewStatus,
+        e.review_round AS reviewRound,
+        e.review_time AS reviewTime,
+        e.assignee_id AS assigneeId,
+        COALESCE(sa.nick_name, sa.user_name) AS assigneeName,
+        e.reviewer_id AS reviewerId,
+        COALESCE(sr.nick_name, sr.user_name) AS reviewerName,
+        e.reject_count AS rejectCount,
+        e.abandon_by AS abandonBy,
+        e.skip_by AS skipBy,
+        e.assign_time AS assignTime,
+        e.create_time AS createTime,
+        e.update_time AS updateTime,
+        t.id AS taskId,
+        t.task_name AS taskName,
+        t.project_id AS projectId,
+        p.project_name AS projectName,
+        (SELECT GROUP_CONCAT(DISTINCT team.team_name ORDER BY team.id)
+           FROM label_task_team tt
+           JOIN label_team team ON team.id = tt.team_id AND team.deleted = 0
+          WHERE tt.task_id = t.id AND tt.deleted = 0) AS teamName,
+        (SELECT COUNT(*) FROM label_asset inv
+          WHERE inv.entry_id = e.id AND inv.deleted = 0 AND inv.frame_flag = 'invalid') AS invalidFrameCount
+    </sql>
+
+    <select id="countEntries" resultType="long">
+        SELECT COUNT(*)
+        <include refid="entryFrom"/>
+        WHERE <include refid="entryScope"/>
+        <include refid="entryFilters"/>
+    </select>
+
+    <select id="selectEntries" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT <include refid="entryColumns"/>
+        <include refid="entryFrom"/>
+        WHERE <include refid="entryScope"/>
+        <include refid="entryFilters"/>
+        ORDER BY e.batch_id, e.seq_no, e.id
+        LIMIT #{offset}, #{limit}
+    </select>
+
+    <select id="selectEntrySummary" resultType="org.dromara.label.vo.TaskEntrySummaryVO">
+        <!-- 总览计数与总览页签同口径：只统计「当前节点」仍停留在标注节点的条目 -->
+        SELECT IFNULL(SUM(CASE WHEN <include refid="currentNodeAtLabel"/> THEN 1 ELSE 0 END), 0) AS total,
+               <!-- pending 字段为待领取池口径（待分配 + 未修订/修订中/已修订），非「待办项」页签（claimed）口径 -->
+               IFNULL(SUM(CASE WHEN e.label_status IN ('pending', 'unrevised', 'revising', 'revised')
+                               THEN 1 ELSE 0 END), 0) AS pending,
+               IFNULL(SUM(CASE WHEN e.label_status = 'labeling' THEN 1 ELSE 0 END), 0) AS labeling,
+               IFNULL(SUM(CASE WHEN e.label_status = 'labeled' THEN 1 ELSE 0 END), 0) AS labeled,
+               IFNULL(SUM(CASE WHEN e.label_status = 'unrevised' THEN 1 ELSE 0 END), 0) AS unrevised,
+               IFNULL(SUM(CASE WHEN e.label_status = 'revising' THEN 1 ELSE 0 END), 0) AS revising,
+               IFNULL(SUM(CASE WHEN e.label_status = 'revised' THEN 1 ELSE 0 END), 0) AS revised,
+               IFNULL(SUM(CASE WHEN e.label_status = 'skipped' THEN 1 ELSE 0 END), 0) AS skipped,
+               IFNULL(SUM(CASE WHEN e.label_status = 'abandoned' THEN 1 ELSE 0 END), 0) AS abandoned
+        FROM label_data_entry e
+        JOIN label_task t ON t.id = #{taskId}
+        WHERE <include refid="entryScope"/>
+        <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+        <include refid="teamScopeFilterEntry"/>
+    </select>
+
+    <!--
+      ============ 按工作流节点查询条目（任务详情页节点切换） ============
+      每个节点统一：pending（池子） / claimed（待办） / skipped / abandoned / done
+    -->
+
+    <sql id="nodeEntryScope">
+        <include refid="entryScope"/>
+        AND n.deleted = 0 AND n.node_key = #{nodeKey}
+    </sql>
+
+    <sql id="nodeEntryFilters">
+        <if test="batchId != null">
+            AND e.batch_id = #{batchId}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND (e.entry_name LIKE CONCAT('%', #{keyword}, '%')
+                 OR e.entry_no LIKE CONCAT('%', #{keyword}, '%')
+                 OR u.file_name LIKE CONCAT('%', #{keyword}, '%'))
+        </if>
+        <if test="tab != null and tab != ''">
+            <choose>
+                <when test="tab == 'pending'">AND n.status = 'pending'</when>
+                <when test="tab == 'claimed'">AND n.status = 'claimed'</when>
+                <when test="tab == 'skipped'">AND n.status = 'skipped'</when>
+                <when test="tab == 'abandoned'">AND n.status = 'abandoned'</when>
+                <when test="tab == 'done'">AND n.status = 'done'</when>
+            </choose>
+        </if>
+        <!-- 总览（无 tab）：只看「当前节点」仍停留在本节点的条目，与列表「当前节点」列口径一致 -->
+        <if test="tab == null or tab == ''">
+            AND <include refid="currentNodeAtNode"/>
+        </if>
+        <if test="scope == 'mine' and userId != null">
+            <!--
+              普通成员可见性：未领取条目成员不可见（只有团队负责人/任务管理员在总览可见）。
+              总览 = 自己领取过的条目（operator_id，与标注节点 assignee 口径一致：
+              领取后跳过/放弃/完成均保留 operator_id）；待办/已完成只看自己；跳过/放弃按操作人。
+            -->
+            <choose>
+                <when test="tab == 'pending'">AND 1 = 0</when>
+                <when test="tab == 'claimed'">AND n.operator_id = #{userId}</when>
+                <when test="tab == 'skipped'">AND n.skip_by = #{userId}</when>
+                <when test="tab == 'abandoned'">AND n.abandon_by = #{userId}</when>
+                <when test="tab == 'done'">AND n.operator_id = #{userId}</when>
+                <otherwise>AND n.operator_id = #{userId}</otherwise>
+            </choose>
+        </if>
+    </sql>
+
+    <select id="countEntriesByNode" resultType="long">
+        SELECT COUNT(*)
+        FROM label_data_entry e
+        JOIN label_task t ON t.id = #{taskId}
+        LEFT JOIN label_upload u ON u.id = e.upload_id
+        JOIN label_entry_node n ON n.entry_id = e.id
+        WHERE <include refid="nodeEntryScope"/>
+        <include refid="nodeEntryFilters"/>
+    </select>
+
+    <select id="selectEntriesByNode" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT
+            e.id,
+            e.entry_no AS entryNo,
+            e.entry_name AS entryName,
+            e.entry_name AS fileName,
+            e.asset_count AS assetCount,
+            u.file_name AS uploadName,
+            fa.file_url AS fileUrl,
+            fa.thumbnail_url AS thumbnailUrl,
+            e.batch_id AS batchId,
+            COALESCE(b.batch_name, b.batch_no) AS batchName,
+            e.media_type AS mediaType,
+            e.parse_status AS parseStatus,
+            e.label_status AS labelStatus,
+            e.review_status AS reviewStatus,
+            e.review_round AS reviewRound,
+            e.review_time AS reviewTime,
+            e.assignee_id AS assigneeId,
+            COALESCE(sa.nick_name, sa.user_name) AS assigneeName,
+            e.reviewer_id AS reviewerId,
+            COALESCE(sr.nick_name, sr.user_name) AS reviewerName,
+            e.reject_count AS rejectCount,
+            e.abandon_by AS abandonBy,
+            e.skip_by AS skipBy,
+            e.assign_time AS assignTime,
+            e.create_time AS createTime,
+            e.update_time AS updateTime,
+            t.id AS taskId,
+            t.task_name AS taskName,
+            t.project_id AS projectId,
+            p.project_name AS projectName,
+            n.operator_id AS nodeOperatorId,
+            COALESCE(sn.nick_name, sn.user_name) AS nodeOperatorName,
+            n.status AS nodeStatus,
+            n.prev_status AS nodePrevStatus,
+            n.skip_by AS nodeSkipBy,
+            n.abandon_by AS nodeAbandonBy,
+            n.claim_time AS nodeClaimTime,
+            (SELECT COUNT(*) FROM label_asset inv
+              WHERE inv.entry_id = e.id AND inv.deleted = 0 AND inv.frame_flag = 'invalid') AS invalidFrameCount
+        FROM label_data_entry e
+        JOIN label_task t ON t.id = #{taskId}
+        LEFT JOIN label_upload u ON u.id = e.upload_id
+        LEFT JOIN label_asset_batch b ON b.id = e.batch_id
+        LEFT JOIN label_project p ON p.id = t.project_id
+        LEFT JOIN sys_user sa ON sa.user_id = e.assignee_id
+        LEFT JOIN sys_user sr ON sr.user_id = e.reviewer_id
+        <!-- 首个资产：fileUrl/thumbnailUrl 走 first_asset_id 主键 JOIN（一对零/一，不改变行数） -->
+        LEFT JOIN label_asset fa ON fa.id = e.first_asset_id AND fa.deleted = 0
+        JOIN label_entry_node n ON n.entry_id = e.id
+        LEFT JOIN sys_user sn ON sn.user_id = n.operator_id
+        WHERE <include refid="nodeEntryScope"/>
+        <include refid="nodeEntryFilters"/>
+        ORDER BY e.batch_id, e.seq_no, e.id
+        LIMIT #{offset}, #{limit}
+    </select>
+
+    <!--
+      节点视图统计：scope=mine 时按成员口径过滤（与 nodeEntryFilters 保持一致）：
+      未领取条目不计入（成员不可见），待办/已完成只统计自己，跳过/放弃按操作人。
+    -->
+    <select id="selectEntrySummaryByNode" resultType="org.dromara.label.vo.TaskEntrySummaryVO">
+        <!-- 总览计数与总览页签同口径：只统计「当前节点」仍停留在本节点的条目 -->
+        SELECT IFNULL(SUM(CASE WHEN <include refid="currentNodeAtNode"/> THEN 1 ELSE 0 END), 0) AS total,
+               IFNULL(SUM(CASE WHEN n.status = 'pending'
+                         <if test="scope == 'mine' and userId != null">AND 1 = 0</if>
+                         THEN 1 ELSE 0 END), 0) AS nodePending,
+               IFNULL(SUM(CASE WHEN n.status = 'claimed'
+                         <if test="scope == 'mine' and userId != null">AND n.operator_id = #{userId}</if>
+                         THEN 1 ELSE 0 END), 0) AS nodeClaimed,
+               IFNULL(SUM(CASE WHEN n.status = 'skipped'
+                         <if test="scope == 'mine' and userId != null">AND n.skip_by = #{userId}</if>
+                         THEN 1 ELSE 0 END), 0) AS nodeSkipped,
+               IFNULL(SUM(CASE WHEN n.status = 'abandoned'
+                         <if test="scope == 'mine' and userId != null">AND n.abandon_by = #{userId}</if>
+                         THEN 1 ELSE 0 END), 0) AS nodeAbandoned,
+               IFNULL(SUM(CASE WHEN n.status = 'done'
+                         <if test="scope == 'mine' and userId != null">AND n.operator_id = #{userId}</if>
+                         THEN 1 ELSE 0 END), 0) AS nodeDone
+        FROM label_data_entry e
+        JOIN label_task t ON t.id = #{taskId}
+        JOIN label_entry_node n ON n.entry_id = e.id
+        WHERE <include refid="nodeEntryScope"/>
+        <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+        <if test="scope == 'mine' and userId != null">
+            AND n.operator_id = #{userId}
+        </if>
+    </select>
+
+    <!--
+      「总览」成员可见性（普通成员视角）：仅本人参与过的条目可见（任一节点记录
+      operator_id = 本人；领取后跳过/放弃/完成均保留 operator_id，口径与 nodeEntryFilters
+      的 mine 分支一致）。团队负责人 / 任务管理员 / 超管不传 scope=mine，不做限制。
+    -->
+    <sql id="overviewMemberScope">
+        <if test="scope == 'mine' and userId != null">
+            AND EXISTS (SELECT 1 FROM label_entry_node nm
+                        WHERE nm.entry_id = e.id AND nm.task_id = #{taskId} AND nm.deleted = 0
+                          AND nm.operator_id = #{userId})
+        </if>
+    </sql>
+
+    <!--
+      任务详情「总览」分页：该任务（含下发批次）下的条目，每行一条，可见性按角色分叉：
+      团队负责人 / 任务管理员 / 超管看全部条目，可见性不依赖 label_entry_node 是否存在记录；
+      普通成员（scope=mine）仅看本人参与过的条目（见 overviewMemberScope 片段）。
+      投影只取列表页展示与行内判定所需字段（数据类型取任务属性 t.data_type）；
+      节点状态/跳过人/放弃人从该 entry 在该 task 下最新一条节点记录 LEFT JOIN 拼上，无记录时为空；
+      statusList 仅在前端按页签显式传入时按最新节点记录状态过滤。
+    -->
+    <select id="selectOverviewEntries" resultType="org.dromara.label.vo.TaskOverviewEntryVO">
+        SELECT
+            e.id,
+            e.entry_no   AS entryNo,
+            e.entry_name AS entryName,
+            e.asset_count AS assetCount,
+            <!-- 条目首图（用于任务详情列表的每条目预览） -->
+            fa.file_url AS fileUrl,
+            fa.thumbnail_url AS thumbnailUrl,
+            COALESCE(b.batch_name, b.batch_no) AS batchName,
+            t.data_type AS mediaType,
+            e.label_status  AS labelStatus,
+            e.review_status AS reviewStatus,
+            e.assignee_id AS assigneeId,
+            COALESCE(sa.nick_name, sa.user_name) AS assigneeName,
+            e.reviewer_id AS reviewerId,
+            COALESCE(sr.nick_name, sr.user_name) AS reviewerName,
+            e.reject_count AS rejectCount,
+            e.abandon_by AS abandonBy,
+            e.skip_by    AS skipBy,
+            e.update_time AS updateTime,
+            COALESCE(team.team_name, '未分组') AS teamName,
+            n.node_key   AS nodeKey,
+            n.status     AS nodeStatus,
+            n.skip_by    AS nodeSkipBy,
+            n.abandon_by AS nodeAbandonBy,
+            (SELECT COUNT(*) FROM label_asset inv
+              WHERE inv.entry_id = e.id AND inv.deleted = 0 AND inv.frame_flag = 'invalid') AS invalidFrameCount
+        FROM label_data_entry e
+        JOIN label_task t ON t.id = #{taskId} AND t.deleted = 0
+        LEFT JOIN label_asset_batch b ON b.id = e.batch_id AND b.deleted = 0
+        LEFT JOIN label_asset fa ON fa.id = e.first_asset_id AND fa.deleted = 0
+        LEFT JOIN sys_user sa ON sa.user_id = e.assignee_id
+        LEFT JOIN sys_user sr ON sr.user_id = e.reviewer_id
+        <!-- 下发团队只需展示主团队：label_task.team_id 对应的 label_team.team_name，不再按 label_task_team 聚合拼接 -->
+        LEFT JOIN label_team team ON team.id = t.team_id AND team.deleted = 0
+        -- 「总览」按 entry 一行：拼上该 entry 冗余的 latest_node_id 指向的最新节点记录
+        -- （无记录则为 NULL；指针由 EntryNodeService 维护，软删记录按 NULL 处理，与原相关子查询口径一致）
+        LEFT JOIN label_entry_node n ON n.id = e.latest_node_id AND n.deleted = 0
+        WHERE e.deleted = 0
+          AND e.task_id = #{taskId}
+          <!-- 总览只展示未放弃的条目：已放弃数据统一在「已放弃」页签查看（条目级与节点级都排除） -->
+          AND (e.label_status IS NULL OR e.label_status &lt;&gt; 'abandoned')
+          AND (n.status IS NULL OR n.status &lt;&gt; 'abandoned')
+          <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+          <include refid="overviewMemberScope"/>
+          <if test="statusList != null and statusList.size() > 0">
+              AND n.status IN
+              <foreach collection="statusList" item="s" open="(" separator="," close=")">#{s}</foreach>
+          </if>
+          <if test="keyword != null and keyword != ''">
+              AND (e.entry_name LIKE CONCAT('%', #{keyword}, '%')
+                OR e.entry_no   LIKE CONCAT('%', #{keyword}, '%'))
+          </if>
+        <!-- 排序固定为默认条目号顺序（批次 + 序号 + id），已领取/最近更新的条目不再置顶，
+             保证总览页与领取/默认条目顺序一致 -->
+        ORDER BY e.batch_id, e.seq_no, e.id
+        LIMIT #{offset}, #{limit}
+    </select>
+
+    <!-- 与 selectOverviewEntries 同口径计数（含相同的角色可见性分叉），statusList 显式传入时按最新节点状态过滤。 -->
+    <select id="countOverviewEntries" resultType="long">
+        SELECT COUNT(*)
+        FROM label_data_entry e
+        LEFT JOIN label_entry_node n ON n.id = e.latest_node_id AND n.deleted = 0
+        WHERE e.deleted = 0
+          AND e.task_id = #{taskId}
+          <!-- 与 selectOverviewEntries 同口径排除已放弃，保证 total 与列表一致 -->
+          AND (e.label_status IS NULL OR e.label_status &lt;&gt; 'abandoned')
+          AND (n.status IS NULL OR n.status &lt;&gt; 'abandoned')
+          <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+          <include refid="overviewMemberScope"/>
+          <if test="statusList != null and statusList.size() > 0">
+              AND n.status IN
+              <foreach collection="statusList" item="s" open="(" separator="," close=")">#{s}</foreach>
+          </if>
+          <if test="keyword != null and keyword != ''">
+              AND (e.entry_name LIKE CONCAT('%', #{keyword}, '%')
+                OR e.entry_no   LIKE CONCAT('%', #{keyword}, '%'))
+          </if>
+    </select>
+
+    <!--
+      任务详情「总览」状态分布统计，与列表同口径（含相同的角色可见性分叉）。
+      batchId 可空，为空时跨 batch 聚合；total = 可见范围内全部条目数（含无节点记录的条目）；
+      各状态桶按最新一条节点记录统计，无节点记录或最新记录为 pending 均计入 pending（未领取）。
+    -->
+    <select id="selectOverviewEntriesSummary" resultType="org.dromara.label.vo.TaskOverviewEntriesSummaryVO">
+        SELECT
+            COUNT(*) AS total,
+            IFNULL(SUM(CASE WHEN n.status IS NULL OR n.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+            IFNULL(SUM(CASE WHEN n.status = 'claimed'   THEN 1 ELSE 0 END), 0) AS claimed,
+            IFNULL(SUM(CASE WHEN n.status = 'skipped'   THEN 1 ELSE 0 END), 0) AS skipped,
+            IFNULL(SUM(CASE WHEN n.status = 'abandoned' THEN 1 ELSE 0 END), 0) AS abandoned,
+            IFNULL(SUM(CASE WHEN n.status = 'done'      THEN 1 ELSE 0 END), 0) AS done
+        FROM label_data_entry e
+        LEFT JOIN label_entry_node n ON n.id = e.latest_node_id AND n.deleted = 0
+        WHERE e.deleted = 0
+          AND e.task_id = #{taskId}
+          <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+          <include refid="overviewMemberScope"/>
+    </select>
+
+    <!--
+      审核节点自动领取定位：该节点池子（status=pending）中第一条可领取的待审核条目。
+      与领取校验（ReviewService#claimEntries）同口径：已标注/已修订且未审核；
+      按批次与条目序号排序，保证多人顺序领取时口径稳定。
+    -->
+    <select id="selectFirstPendingNodeEntry" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT e.id,
+               e.entry_name AS entryName,
+               (SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN 'mixed' ELSE MIN(a.media_type) END
+                  FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0) AS mediaType
+        FROM label_data_entry e
+        JOIN label_entry_node n ON n.entry_id = e.id
+        WHERE <include refid="nodeEntryScope"/>
+          AND n.status = 'pending'
+          AND e.label_status IN ('labeled', 'revised')
+          AND e.review_status = 'none'
+        ORDER BY e.batch_id, e.seq_no, e.id
+        LIMIT 1
+    </select>
+
+    <!--
+      节点池子兜底（自动领取 claimAuto 用）：
+      任意 pending 第一条，且 label_status 必须是 labeled/revised。
+      review_status 不限制（selectFirstPendingNodeEntry 要求 review_status='none'；
+      这里放宽是因为：pending 条目节点上一定未领取，节点审核的 result trace 不影响领取可行性）。
+      label_status 不放宽是因为 ReviewServiceImpl.claimEntries 硬性校验 labeled/revised，
+      不满足直接抛"仅已标注/已修订且未审核的条目可以领取审核"。
+    -->
+    <select id="selectAnyFirstPendingNodeEntry" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT e.id,
+               e.entry_name AS entryName,
+               (SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN 'mixed' ELSE MIN(a.media_type) END
+                  FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0) AS mediaType
+        FROM label_data_entry e
+        JOIN label_entry_node n ON n.entry_id = e.id
+        WHERE <include refid="nodeEntryScope"/>
+          AND n.status = 'pending'
+          AND e.label_status IN ('labeled', 'revised')
+        ORDER BY e.batch_id, e.seq_no, e.id
+        LIMIT 1
+    </select>
+
+    <!--
+      节点视图领取按钮专用：定位本人在该任务该节点下已领取（status='claimed' 且 operator_id=我）的第一条。
+      按 n.claim_time ASC 升序排（先领取的先审，FIFO 处理积压）；同时间再按 n.id ASC 兜底稳定排序。
+      不复用 nodeEntryScope 是因为该 sql 片段会在 scope='mine' 下过滤掉 n.status='pending' 之外的条目，
+      而这里只看 claimed（且 operator_id=我），与列表 tab/scope 都无关——按钮专用入口。
+    -->
+    <select id="selectMyFirstClaimedNodeEntry" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT e.id,
+               e.entry_name AS entryName,
+               (SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN 'mixed' ELSE MIN(a.media_type) END
+                  FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0) AS mediaType,
+               n.claim_time AS nodeClaimTime
+        FROM label_data_entry e
+        JOIN label_entry_node n ON n.entry_id = e.id
+        WHERE n.deleted = 0
+          AND n.node_key COLLATE utf8mb4_general_ci = #{nodeKey}
+          AND n.task_id = #{taskId}
+          AND n.status = 'claimed'
+          AND n.operator_id = #{userId}
+          AND e.deleted = 0
+          AND e.task_id = #{taskId}
+        ORDER BY n.claim_time ASC, n.id ASC
+        LIMIT 1
+    </select>
+
+    <!--
+      自动领取-待办定位：本人在该任务下已领取且未完成（标注中/修订中/未修订）的第一条条目；
+      被驳回的「未修订」条目排序最前（优先处理），领取时由上层置为「修订中」。
+    -->
+    <select id="selectMyTodoEntry" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT e.id,
+               e.entry_name AS entryName,
+               e.label_status AS labelStatus,
+               (SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN 'mixed' ELSE MIN(a.media_type) END
+                  FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0) AS mediaType
+        FROM label_data_entry e
+        WHERE <include refid="entryScope"/>
+          <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+          AND e.assignee_id = #{userId}
+          AND e.label_status IN ('labeling', 'revising', 'unrevised')
+        ORDER BY CASE e.label_status WHEN 'unrevised' THEN 0 ELSE 1 END, e.batch_id, e.seq_no, e.id
+        LIMIT 1
+    </select>
+
+    <!--
+      自动领取-随机分配：随机挑选一条「待分配且无人领取」的条目；
+      随后用 updateEntryClaim 的条件更新（assignee_id IS NULL AND label_status='pending'）抢占，
+      更新行数为 0 说明刚被其他成员领走，由上层提示重试，避免并发重复分配。
+    -->
+    <select id="selectRandomPendingEntry" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT e.id,
+               e.entry_name AS entryName,
+               (SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN 'mixed' ELSE MIN(a.media_type) END
+                  FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0) AS mediaType
+        FROM label_data_entry e
+        WHERE <include refid="entryScope"/>
+          <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+          AND e.assignee_id IS NULL
+          AND e.label_status = 'pending'
+        ORDER BY RAND()
+        LIMIT 1
+    </select>
+
+    <!--
+      自动领取-接管修订：任务池内已无「待分配」条目时，挑选一条被驳回待修订的条目（不限归属）；
+      「未修订」优先于「修订中」，随后用 updateEntryTakeRevise 的条件更新（label_status IN ('unrevised','revising')）抢占，
+      更新行数为 0 说明状态刚被其他成员流转，由上层提示重试。
+    -->
+    <select id="selectRandomRevisableEntry" resultType="org.dromara.label.vo.TaskEntryVO">
+        SELECT e.id,
+               e.entry_name AS entryName,
+               e.label_status AS labelStatus,
+               (SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN 'mixed' ELSE MIN(a.media_type) END
+                  FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0) AS mediaType
+        FROM label_data_entry e
+        WHERE <include refid="entryScope"/>
+          <if test="batchId != null">AND e.batch_id = #{batchId}</if>
+          AND e.label_status IN ('unrevised', 'revising')
+        ORDER BY CASE e.label_status WHEN 'unrevised' THEN 0 ELSE 1 END, e.batch_id, e.seq_no, e.id
+        LIMIT 1
+    </select>
+
+    <select id="selectTeamMemberUserIds" resultType="long">
+        SELECT DISTINCT m.user_id
+        FROM label_team_member m
+        WHERE m.deleted = 0 AND m.team_id IN
+        <foreach collection="teamIds" item="tid" open="(" separator="," close=")">
+            #{tid}
+        </foreach>
+    </select>
+
+    <!--
+      条目范围明细：把数据条目展开为包内数据资产（作业归集按数据资产粒度进行），
+      并给出每条条目的批次与数据类型（包内类型不一致时记为 mixed）。
+    -->
+    <select id="selectAssetScope" resultType="map">
+        SELECT a.id AS assetId, e.id AS entryId, e.batch_id AS batchId,
+               a.media_type AS assetMediaType,
+               CASE WHEN m.kinds > 1 THEN 'mixed' ELSE m.mediaType END AS dataType
+        FROM label_data_entry e
+        JOIN label_asset a ON a.entry_id = e.id AND a.deleted = 0
+        JOIN (SELECT a2.entry_id AS entryId,
+                     COUNT(DISTINCT a2.media_type) AS kinds,
+                     MIN(a2.media_type) AS mediaType
+              FROM label_asset a2
+              WHERE a2.deleted = 0 AND a2.entry_id IS NOT NULL
+              GROUP BY a2.entry_id) m ON m.entryId = e.id
+        WHERE e.deleted = 0 AND e.id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </select>
+
+    <update id="updateEntryAssign">
+        UPDATE label_data_entry
+        SET assignee_id = #{assigneeId},
+            reviewer_id = #{reviewerId},
+            label_status = #{labelStatus},
+            review_status = 'none',
+            assign_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status &lt;&gt; 'abandoned'
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 领取标注：只更新「待分配且尚未指定标注员」的条目，已被领取过的条目不会被重复领取 -->
+    <update id="updateEntryClaim">
+        UPDATE label_data_entry
+        SET assignee_id = #{assigneeId},
+            reviewer_id = #{reviewerId},
+            label_status = 'labeling',
+            review_status = 'none',
+            assign_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND assignee_id IS NULL
+          AND label_status = 'pending'
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 条目状态快照（跳过/放弃/领取修订前校验选中条目的当前状态与归属） -->
+    <select id="selectEntryStatuses" resultType="map">
+        SELECT e.id AS entryId,
+               e.task_id AS taskId,
+               e.batch_id AS batchId,
+               e.label_status AS labelStatus,
+               e.review_status AS reviewStatus,
+               e.assignee_id AS assigneeId,
+               e.reviewer_id AS reviewerId,
+               e.abandon_by AS abandonBy,
+               e.abandon_prev_status AS abandonPrevStatus,
+               e.skip_by AS skipBy,
+               e.skip_prev_status AS skipPrevStatus
+        FROM label_data_entry e
+        WHERE e.deleted = 0 AND e.id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </select>
+
+    <!--
+      标注员跳过：仅「标注中/修订中」且在自己名下的条目可跳过（超管不受归属限制）；
+      记录跳过人/跳过时间/跳过前状态，供「已跳过」页签展示与恢复时回滚。
+    -->
+    <update id="updateEntrySkip">
+        UPDATE label_data_entry
+        SET skip_prev_status = label_status,
+            label_status = 'skipped',
+            skip_by = #{userId},
+            skip_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status IN ('labeling', 'revising')
+          <if test="!superAdmin">
+              AND assignee_id = #{userId}
+          </if>
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!--
+      释放领取：状态按条目自身状态自动回退（标注中→待分配、修订中→未修订、审核中/复审中→未审核）并清空处理人。
+      【SET 列顺序敏感】assignee_id/assign_time/reviewer_id 的 CASE 必须排在 label_status/review_status
+      回退之前——MySQL 单表 UPDATE 的 SET 从左到右求值，若先回退状态，后面的 CASE 读到的是已回退的新状态，
+      条件恒不成立，处理人永远清不掉（历史缺陷：释放后 assignee_id 残留，条目呈「待分配但有人」，
+      selectRandomPendingEntry 的 assignee_id IS NULL 永远不命中，谁都领取不到）。
+    -->
+    <update id="updateEntryRelease">
+        UPDATE label_data_entry
+        SET assignee_id = CASE WHEN label_status IN ('labeling', 'revising') THEN NULL ELSE assignee_id END,
+            assign_time = CASE WHEN label_status IN ('labeling', 'revising') THEN NULL ELSE assign_time END,
+            reviewer_id = CASE WHEN review_status IN ('reviewing', 're_reviewing') THEN NULL ELSE reviewer_id END,
+            label_status = CASE label_status
+                WHEN 'labeling' THEN 'pending'
+                WHEN 'revising' THEN 'unrevised'
+                ELSE label_status END,
+            review_status = CASE review_status
+                WHEN 'reviewing' THEN 'none'
+                WHEN 're_reviewing' THEN 'none'
+                ELSE review_status END,
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND (label_status IN ('labeling', 'revising')
+               OR review_status IN ('reviewing', 're_reviewing'))
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!--
+      标注员放弃条目：仅「标注中/修订中」且在自己名下的条目可放弃（超管不受归属限制）；
+      记录放弃人/放弃时间/放弃前状态，供「已放弃」页签展示与恢复时回滚。
+    -->
+    <update id="updateEntryAbandon">
+        UPDATE label_data_entry
+        SET abandon_prev_status = label_status,
+            label_status = 'abandoned',
+            review_status = 'none',
+            abandon_by = #{userId},
+            abandon_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status IN ('labeling', 'revising')
+          <if test="!superAdmin">
+              AND assignee_id = #{userId}
+          </if>
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!--
+      恢复已放弃条目：仅放弃人本人可恢复（放弃规则明确「只有放弃的那个人可以恢复」），
+      标注状态回滚到放弃前状态（缺省回退为标注中），以便继续标注。
+    -->
+    <update id="updateEntryRestore">
+        UPDATE label_data_entry
+        SET label_status = CASE
+                WHEN abandon_prev_status IS NULL OR abandon_prev_status = '' THEN 'labeling'
+                ELSE abandon_prev_status END,
+            assignee_id = IFNULL(assignee_id, #{userId}),
+            assign_time = IFNULL(assign_time, NOW()),
+            abandon_by = NULL,
+            abandon_time = NULL,
+            abandon_prev_status = NULL,
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status = 'abandoned'
+          AND abandon_by = #{userId}
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!--
+      恢复已跳过条目：标注状态回滚到跳过前状态（缺省回退为 labeling），
+      跳过后/时间/前状态清空；归属（assignee_id）保留为跳过人本人以便继续标注。
+      权限判定在业务层完成（本人/团队负责人/任务管理员），本 SQL 不再校验 skip_by。
+    -->
+    <update id="updateEntryRestoreSkipped">
+        UPDATE label_data_entry
+        SET label_status = CASE
+                WHEN skip_prev_status IS NULL OR skip_prev_status = '' THEN 'labeling'
+                ELSE skip_prev_status END,
+            skip_by = NULL,
+            skip_time = NULL,
+            skip_prev_status = NULL,
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status = 'skipped'
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 按条目回写作业(job)状态：审核驳回→已退回(review_rejected)；领取修订→标注中(labeling) -->
+    <update id="updateJobStatusByAssetIds">
+        UPDATE label_job j
+        JOIN label_job_asset ja ON ja.job_id = j.id
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+        SET j.status = #{status},
+            j.updated_by = #{userId},
+            j.update_time = NOW()
+        WHERE a.entry_id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 领取修订：把「未修订」的条目录取为自己修订，进入修订中 -->
+    <update id="updateEntryClaimRevise">
+        UPDATE label_data_entry
+        SET label_status = 'revising',
+            assignee_id = #{userId},
+            assign_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status = 'unrevised'
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 接管修订：把「未修订/修订中」条目（含他人名下）的修订人置为当前用户，统一进入修订中 -->
+    <update id="updateEntryTakeRevise">
+        UPDATE label_data_entry
+        SET label_status = 'revising',
+            assignee_id = #{userId},
+            assign_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND label_status IN ('unrevised', 'revising')
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!--
+      领取标注/领取修订/接管修订后，把 entry × task × label 节点的 claimed 记录落库，
+      供总览 / 节点视图拼接节点流转显示字段（领取人、领取时间、节点状态等）；
+      走 uk_entry_node(entry_id, node_key) 唯一键：无记录则插入；已有记录（释放回池 pending、
+      上一轮流转残留、软删占位）则原地置回 claimed——不能再用 INSERT IGNORE：二次领取时
+      唯一键冲突会被静默忽略，节点记录停留在 pending，总览/节点视图会显示过期的待领取状态。
+      node_key / node_type 与 WorkflowService.KEY_LABEL / NODE_TYPE_LABEL 常量保持一致。
+    -->
+    <insert id="insertEntryNodeClaim">
+        INSERT INTO label_entry_node (
+            entry_id, task_id, node_key, node_type, status,
+            operator_id, claim_time,
+            created_by, updated_by, create_time, update_time, deleted
+        ) VALUES
+        <foreach collection="entryIds" item="entryId" separator=",">
+            (#{entryId}, #{taskId}, 'label', 'label', 'claimed',
+             #{operatorId}, NOW(),
+             #{userId}, #{userId}, NOW(), NOW(), 0)
+        </foreach>
+        ON DUPLICATE KEY UPDATE
+            status = 'claimed',
+            operator_id = #{operatorId},
+            claim_time = NOW(),
+            done_time = NULL,
+            prev_status = NULL,
+            skip_by = NULL,
+            skip_time = NULL,
+            abandon_by = NULL,
+            abandon_time = NULL,
+            deleted = 0,
+            updated_by = #{userId},
+            update_time = NOW()
+    </insert>
+
+    <!-- 条目级流转（领取/分配/跳过/领取修订/审核）后，把条目的状态同步到包内全部数据资产 -->
+    <update id="syncAssetsFromEntries">
+        UPDATE label_asset a
+        JOIN label_data_entry e ON e.id = a.entry_id
+        SET a.assignee_id = e.assignee_id,
+            a.reviewer_id = e.reviewer_id,
+            a.label_status = e.label_status,
+            a.review_status = e.review_status,
+            a.review_round = e.review_round,
+            a.reject_count = e.reject_count,
+            a.assign_time = e.assign_time,
+            a.review_time = e.review_time,
+            a.update_time = NOW()
+        WHERE a.deleted = 0 AND e.deleted = 0 AND e.id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <delete id="deleteJobAssetsByTaskAndAssets">
+        DELETE ja FROM label_job_asset ja
+        JOIN label_job j ON j.id = ja.job_id
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+        WHERE j.task_id = #{taskId} AND a.entry_id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </delete>
+
+    <!-- 条目当前挂载的作业ID（放弃条目时先把数据从作业摘除，再刷新这些作业的范围信息） -->
+    <select id="selectJobIdsByTaskAndEntries" resultType="long">
+        SELECT DISTINCT ja.job_id
+        FROM label_job_asset ja
+        JOIN label_job j ON j.id = ja.job_id AND j.task_id = #{taskId} AND j.deleted = 0
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+        WHERE a.entry_id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </select>
+
+    <!-- 任务下已放弃的条目数（任务状态聚合用，见 <include refid="entryScope"/> 的口径） -->
+    <select id="countAbandonedEntries" resultType="long">
+        SELECT COUNT(*)
+        FROM label_data_entry e
+        WHERE <include refid="entryScope"/> AND e.label_status = 'abandoned'
+    </select>
+
+    <insert id="insertJobAssetsByAssetIds">
+        INSERT IGNORE INTO label_job_asset (job_id, asset_id, sort_order)
+        SELECT #{jobId}, a.id, ROW_NUMBER() OVER (ORDER BY a.id)
+        FROM label_asset a
+        WHERE a.deleted = 0 AND a.id IN
+        <foreach collection="assetIds" item="assetId" open="(" separator="," close=")">
+            #{assetId}
+        </foreach>
+    </insert>
+
+    <select id="selectJobIdByScope" resultType="long">
+        SELECT id FROM label_job
+        WHERE task_id = #{taskId} AND deleted = 0 AND data_type = #{dataType}
+          AND status &lt;&gt; 'completed'
+        <choose>
+            <when test="batchId == null">AND batch_id IS NULL</when>
+            <otherwise>AND batch_id = #{batchId}</otherwise>
+        </choose>
+        <choose>
+            <when test="assigneeId == null">AND assignee_id IS NULL</when>
+            <otherwise>AND assignee_id = #{assigneeId}</otherwise>
+        </choose>
+        ORDER BY id
+        LIMIT 1
+    </select>
+
+    <update id="refreshJobScopeMeta">
+        UPDATE label_job
+        SET asset_count = (SELECT COUNT(*) FROM label_job_asset ja WHERE ja.job_id = label_job.id),
+            status = CASE WHEN assignee_id IS NULL THEN 'pending_assign' ELSE 'pending_label' END,
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{jobId}
+    </update>
+
+    <update id="softDeleteEmptyJobsByTask">
+        UPDATE label_job j
+        LEFT JOIN label_job_asset ja ON ja.job_id = j.id
+        SET j.deleted = 1, j.updated_by = #{userId}, j.update_time = NOW()
+        WHERE j.task_id = #{taskId} AND j.deleted = 0 AND ja.id IS NULL
+    </update>
+
+    <!--
+      条目对应的作业ID（任务详情页「查看/预览标注」按条目打开工作台）。
+      只保证「该条目确实被该任务下的某个作业承载」，不再强求 data_type / batch / assignee 完全相等：
+      条目在流转中（驳回后重新领取、批次调整、重新分配）这几个字段会变，
+      一旦不等就查不到作业，导致「查看 / 审核」入口直接不可用。
+      ORDER BY 仍优先选取标注员一致的作业，保证多作业时结果稳定。
+    -->
+    <select id="selectJobIdByAssetForTask" resultType="long">
+        SELECT j.id
+        FROM label_job j
+        JOIN label_job_asset ja ON ja.job_id = j.id
+        JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+        JOIN label_data_entry e ON e.id = a.entry_id AND e.deleted = 0
+        WHERE j.task_id = #{taskId} AND j.deleted = 0
+          AND e.id = #{assetId}
+        ORDER BY a.id, (j.assignee_id &lt;=&gt; e.assignee_id) DESC, j.id
+        LIMIT 1
+    </select>
+
+    <!--
+      批量查询条目归属作业ID（任务详情「查看」多选/全选时按作业分组打开只读工作台）。
+      与 selectJobIdByAssetForTask 同口径，按条目分组取第一条（ROW_NUMBER 优先标注员一致的作业）；
+      尚未领取（无作业承载）的条目不返回，前端据此回退为原图预览。
+    -->
+    <select id="selectEntryJobIds" resultType="org.dromara.label.vo.EntryJobVO">
+        SELECT t.entryId AS entryId, t.jobId AS jobId
+        FROM (
+            SELECT e.id AS entryId, j.id AS jobId,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e.id
+                       ORDER BY a.id, (j.assignee_id &lt;=&gt; e.assignee_id) DESC, j.id
+                   ) AS rn
+            FROM label_data_entry e
+            JOIN label_asset a ON a.entry_id = e.id AND a.deleted = 0
+            JOIN label_job_asset ja ON ja.asset_id = a.id
+            JOIN label_job j ON j.id = ja.job_id AND j.task_id = #{taskId} AND j.deleted = 0
+            WHERE e.deleted = 0
+              AND e.id IN
+              <foreach collection="entryIds" item="eid" open="(" separator="," close=")">
+                  #{eid}
+              </foreach>
+        ) t
+        WHERE t.rn = 1
+    </select>
+
+    <!-- 任务下发/调整批次后，把批次内的数据条目绑定到任务（新上传条目在创建时已回填） -->
+    <update id="bindEntriesToTask">
+        UPDATE label_data_entry
+        SET task_id = #{taskId}, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND batch_id IN
+        <foreach collection="batchIds" item="batchId" open="(" separator="," close=")">
+            #{batchId}
+        </foreach>
+    </update>
+    <!--
+      任务调整批次移出后，解绑这些批次下仍挂在本任务的条目。
+      条件带 task_id = #{taskId}：只清本任务自己的归属，不误伤已被其它任务接手的条目。
+      与 bindEntriesToTask 成对维护 task_id 这一唯一归属来源。
+    -->
+    <update id="unbindEntriesFromTask">
+        UPDATE label_data_entry
+        SET task_id = NULL, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0
+          AND task_id = #{taskId}
+          AND batch_id IN
+        <foreach collection="batchIds" item="batchId" open="(" separator="," close=")">
+            #{batchId}
+        </foreach>
+    </update>
+
+</mapper>

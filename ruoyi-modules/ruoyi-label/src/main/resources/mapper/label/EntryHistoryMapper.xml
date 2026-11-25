@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.EntryHistoryMapper">
+
+    <!--
+      批量写入条目操作历史：task_id / batch_id 直接从 label_data_entry 带出，
+      调用方只需给 entryId 列表 + 操作信息，避免逐个反查条目归属。
+    -->
+    <insert id="insertBatch">
+        INSERT INTO label_entry_history (
+            entry_id, task_id, batch_id, action, action_name, node_name, detail,
+            operator_id, create_time, deleted
+        )
+        SELECT e.id, e.task_id, e.batch_id, #{action}, #{actionName}, #{nodeName}, #{detail},
+               #{operatorId}, NOW(), 0
+        FROM label_data_entry e
+        WHERE e.deleted = 0
+          AND e.id IN
+        <foreach collection="entryIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </insert>
+
+    <!-- 某条目的操作历史（时间正序，前端按时间线倒序展示自行处理） -->
+    <select id="selectByEntryId" resultType="org.dromara.label.vo.EntryHistoryVO">
+        SELECT h.id            AS id,
+               h.entry_id      AS entryId,
+               h.task_id       AS taskId,
+               h.batch_id      AS batchId,
+               h.action        AS action,
+               h.action_name   AS actionName,
+               h.node_name     AS nodeName,
+               h.detail        AS detail,
+               h.operator_id   AS operatorId,
+               COALESCE(su.nick_name, su.user_name) AS operatorName,
+               h.create_time   AS createTime
+        FROM label_entry_history h
+        LEFT JOIN sys_user su ON su.user_id = h.operator_id
+        WHERE h.deleted = 0
+          AND h.entry_id = #{entryId}
+        ORDER BY h.create_time ASC, h.id ASC
+    </select>
+
+</mapper>

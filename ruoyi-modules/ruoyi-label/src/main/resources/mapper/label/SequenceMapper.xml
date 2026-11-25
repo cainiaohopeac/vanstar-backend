@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.SequenceMapper">
+
+    <sql id="sequenceColumns">
+        s.id,
+        s.project_id AS projectId,
+        s.batch_id AS batchId,
+        b.batch_name AS batchName,
+        s.sequence_token AS sequenceToken,
+        s.name,
+        s.description,
+        s.frame_count AS frameCount,
+        s.first_frame_id AS firstFrameId,
+        s.last_frame_id AS lastFrameId,
+        s.create_time AS createTime
+    </sql>
+
+    <sql id="sequenceFrom">
+        FROM label_sequence s
+        LEFT JOIN label_asset_batch b ON b.id = s.batch_id AND b.deleted = 0
+    </sql>
+
+    <select id="selectSequences" resultType="org.dromara.label.vo.SequenceVO">
+        SELECT <include refid="sequenceColumns"/>
+        <include refid="sequenceFrom"/>
+        WHERE s.deleted = 0 AND s.project_id = #{projectId}
+        <if test="batchId != null">
+            AND s.batch_id = #{batchId}
+        </if>
+        ORDER BY s.id
+    </select>
+
+    <select id="selectSequence" resultType="org.dromara.label.vo.SequenceVO">
+        SELECT <include refid="sequenceColumns"/>
+        <include refid="sequenceFrom"/>
+        WHERE s.deleted = 0 AND s.id = #{id}
+    </select>
+
+    <select id="selectFrames" resultType="org.dromara.label.vo.FrameVO">
+        SELECT f.id, f.sequence_id AS sequenceId, f.frame_token AS frameToken,
+               f.frame_index AS frameIndex, f.timestamp_us AS timestampUs,
+               f.prev_frame_id AS prevFrameId, f.next_frame_id AS nextFrameId,
+               f.is_key_frame AS isKeyFrame
+        FROM label_frame f
+        WHERE f.deleted = 0 AND f.sequence_id = #{sequenceId}
+        ORDER BY f.frame_index
+    </select>
+
+    <select id="selectSensorDataByFrame" resultType="org.dromara.label.vo.SensorDataVO">
+        SELECT sd.id, sd.frame_id AS frameId, sd.sensor_id AS sensorId,
+               sd.calibration_id AS calibrationId, sd.ego_pose_id AS egoPoseId,
+               sd.file_name AS fileName, sd.file_url AS fileUrl,
+               sd.file_format AS fileFormat, sd.width, sd.height,
+               sd.is_key_frame AS isKeyFrame,
+               sn.channel, sn.modality
+        FROM label_sensor_data sd
+        LEFT JOIN label_sensor sn ON sn.id = sd.sensor_id
+        WHERE sd.deleted = 0 AND sd.frame_id = #{frameId}
+        ORDER BY sn.channel
+    </select>
+
+    <select id="selectSensors" resultType="org.dromara.label.vo.SensorVO">
+        SELECT id, project_id AS projectId, channel, modality
+        FROM label_sensor
+        WHERE deleted = 0 AND (project_id = #{projectId} OR project_id IS NULL)
+        ORDER BY id
+    </select>
+
+    <select id="selectClassesOfProject" resultType="org.dromara.label.vo.ClassRefVO">
+        SELECT c.id AS classId, c.label_name AS className, c.color,
+               cs.name AS classSetName, c.tool_type AS toolType
+        FROM label_class c
+        JOIN label_class_set cs ON cs.id = c.class_set_id
+        WHERE cs.project_id = #{projectId} AND c.deleted = 0 AND c.status = 'active'
+        ORDER BY c.sort_order, c.id
+    </select>
+
+    <select id="selectObjectsOfAnnotation" resultType="org.dromara.label.vo.AnnotationObjectVO">
+        SELECT ao.object_key AS objectKey, ao.object_type AS type, ao.class_id AS classId,
+               c.label_name AS className, c.color,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$')) AS geometryJson,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.attr_json, '$')) AS attrJson,
+               ao.track_token AS trackToken, ao.instance_id AS instanceId,
+               ao.visibility
+        FROM label_annotation_object ao
+        LEFT JOIN label_class c ON c.id = ao.class_id
+        WHERE ao.annotation_id = #{annotationId} AND ao.deleted = 0
+        ORDER BY ao.id
+    </select>
+
+    <select id="selectLatestAnnotationIdByFrame" resultType="long">
+        SELECT id FROM label_annotation
+        WHERE deleted = 0 AND frame_id = #{frameId}
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectAnnotationId" resultType="long">
+        SELECT id FROM label_annotation
+        WHERE deleted = 0 AND sequence_id = #{sequenceId} AND frame_id = #{frameId}
+    </select>
+
+    <select id="selectAnnotationErrors" resultType="org.dromara.label.vo.AnnotationErrorVO">
+        SELECT id, sequence_id AS sequenceId, frame_id AS frameId, object_key AS objectKey,
+               error_type AS errorType, error_level AS errorLevel, status, comment,
+               create_time AS createTime
+        FROM label_annotation_error
+        WHERE deleted = 0 AND sequence_id = #{sequenceId}
+        ORDER BY id DESC
+    </select>
+
+    <select id="selectPrechecks" resultType="org.dromara.label.vo.PrecheckVO">
+        SELECT id, sequence_id AS sequenceId, frame_id AS frameId, object_key AS objectKey,
+               check_type AS checkType, message, resolved_flag AS resolvedFlag,
+               create_time AS createTime
+        FROM label_precheck
+        WHERE deleted = 0 AND sequence_id = #{sequenceId}
+        ORDER BY id DESC
+    </select>
+
+    <select id="selectComments" resultType="org.dromara.label.vo.CommentVO">
+        SELECT id, sequence_id AS sequenceId, frame_id AS frameId, node, content, status,
+               creator_id AS creatorId, create_time AS createTime
+        FROM label_comment
+        WHERE deleted = 0 AND sequence_id = #{sequenceId}
+        ORDER BY id DESC
+    </select>
+
+    <select id="selectSensorId" resultType="long">
+        SELECT id FROM label_sensor
+        WHERE deleted = 0 AND project_id = #{projectId} AND channel = #{channel}
+    </select>
+
+    <select id="selectSequenceIdByToken" resultType="long">
+        SELECT id FROM label_sequence
+        WHERE deleted = 0 AND project_id = #{projectId} AND sequence_token = #{token}
+        <if test="batchId != null">
+            AND batch_id = #{batchId}
+        </if>
+    </select>
+
+    <select id="selectCalibrationSensorId" resultType="long">
+        SELECT sensor_id FROM label_calibration WHERE id = #{calibrationId}
+    </select>
+
+    <select id="selectInstanceId" resultType="long">
+        SELECT id FROM label_instance
+        WHERE deleted = 0 AND project_id = #{projectId} AND instance_token = #{instanceToken}
+    </select>
+
+    <!-- ============ 写入 ============ -->
+
+    <insert id="insertSensor" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_sensor (project_id, channel, modality, created_by, updated_by)
+        VALUES (#{projectId}, #{channel}, #{modality}, #{userId}, #{userId})
+    </insert>
+
+    <select id="selectCalibrationIdByToken" resultType="long">
+        SELECT id FROM label_calibration WHERE calibration_token = #{token} AND deleted = 0 LIMIT 1
+    </select>
+
+    <select id="selectEgoPoseIdByToken" resultType="long">
+        SELECT id FROM label_ego_pose WHERE pose_token = #{token} AND deleted = 0 LIMIT 1
+    </select>
+
+    <insert id="insertCalibration" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_calibration (
+            sensor_id, calibration_token, translation, rotation, camera_intrinsic,
+            created_by, updated_by
+        ) VALUES (#{sensorId}, #{token}, #{translation}, #{rotation}, #{cameraIntrinsic}, #{userId}, #{userId})
+    </insert>
+
+    <insert id="insertEgoPose" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_ego_pose (
+            pose_token, translation, rotation, timestamp_us, created_by, updated_by
+        ) VALUES (#{token}, #{translation}, #{rotation}, #{timestampUs}, #{userId}, #{userId})
+    </insert>
+
+    <insert id="insertSequence" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_sequence (
+            project_id, batch_id, sequence_token, name, description, frame_count, created_by, updated_by
+        ) VALUES (#{projectId}, #{batchId}, #{token}, #{name}, #{description}, #{frameCount}, #{userId}, #{userId})
+    </insert>
+
+    <insert id="insertFrame" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_frame (
+            sequence_id, frame_token, frame_index, timestamp_us, prev_frame_id,
+            created_by, updated_by
+        ) VALUES (#{sequenceId}, #{token}, #{frameIndex}, #{timestampUs}, #{prevId}, #{userId}, #{userId})
+    </insert>
+
+    <update id="updateFrameNext">
+        UPDATE label_frame SET next_frame_id = #{frameId} WHERE id = #{prevId}
+    </update>
+
+    <update id="updateSequenceFirstLast">
+        UPDATE label_sequence SET first_frame_id = #{firstFrameId}, last_frame_id = #{lastFrameId}
+        WHERE id = #{id}
+    </update>
+
+    <insert id="insertAnnotation" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_annotation (sequence_id, frame_id, version, status, created_by, updated_by)
+        VALUES (#{sequenceId}, #{frameId}, 1, 'draft', #{userId}, #{userId})
+    </insert>
+
+    <update id="touchAnnotation">
+        UPDATE label_annotation SET update_time = NOW(), updated_by = #{userId} WHERE id = #{id}
+    </update>
+
+    <update id="deleteAnnotationObjects">
+        UPDATE label_annotation_object SET deleted = 1 WHERE annotation_id = #{annotationId}
+    </update>
+
+    <insert id="insertAnnotationObject" parameterType="map">
+        INSERT INTO label_annotation_object (
+            annotation_id, frame_id, object_key, object_type, class_id, geometry_json,
+            attr_json, track_token, instance_id, visibility, created_by, updated_by
+        ) VALUES (
+            #{annotationId}, #{frameId}, #{objectKey}, #{type}, #{classId}, #{geometry},
+            #{attrs}, #{trackToken}, #{instanceId}, #{visibility}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="touchInstance">
+        UPDATE label_instance
+        SET last_frame_id = #{frameId}, annotation_count = annotation_count + 1
+        WHERE id = #{id}
+    </update>
+
+    <insert id="insertInstance" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_instance (
+            project_id, instance_token, class_id, first_frame_id, last_frame_id,
+            annotation_count, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{instanceToken}, #{classId}, #{firstFrameId}, #{lastFrameId},
+            1, #{userId}, #{userId}
+        )
+    </insert>
+
+    <insert id="insertSensorData" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_sensor_data (
+            frame_id, sensor_id, calibration_id, ego_pose_id, file_name, file_url,
+            file_format, width, height, is_key_frame, meta_json, created_by, updated_by
+        ) VALUES (
+            #{frameId}, #{sensorId}, #{calibrationId}, #{egoPoseId}, #{fileName}, #{fileUrl},
+            #{fileFormat}, #{width}, #{height}, #{isKeyFrame}, #{metaJson}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <delete id="deletePrechecks">
+        DELETE FROM label_precheck WHERE sequence_id = #{sequenceId} AND frame_id = #{frameId}
+    </delete>
+
+    <insert id="insertPrecheck" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_precheck (
+            sequence_id, frame_id, object_key, check_type, message, created_by, updated_by
+        ) VALUES (#{sequenceId}, #{frameId}, #{objectKey}, #{checkType}, #{message}, #{userId}, #{userId})
+    </insert>
+
+    <insert id="insertComment" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_comment (
+            sequence_id, frame_id, node, content, status, creator_id, created_by, updated_by
+        ) VALUES (#{sequenceId}, #{frameId}, #{node}, #{content}, 'uncorrected',
+                  #{creatorId}, #{creatorId}, #{creatorId})
+    </insert>
+
+    <update id="correctError">
+        UPDATE label_annotation_error SET status = 'corrected' WHERE id = #{id}
+    </update>
+
+    <update id="correctComment">
+        UPDATE label_comment SET status = 'corrected' WHERE id = #{id}
+    </update>
+
+</mapper>

@@ -1,0 +1,911 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.ProjectMapper">
+
+    <sql id="projectListColumns">
+        p.id,
+        p.project_code AS projectCode,
+        p.project_name AS projectName,
+        p.description,
+        p.data_type AS dataType,
+        p.status,
+        p.owner_id AS ownerId,
+        p.team_id AS teamId,
+        p.start_time AS startTime,
+        p.end_time AS endTime,
+        p.create_time AS createTime,
+        COALESCE(owner.nick_name, owner.user_name, '未分配') AS ownerName,
+        COALESCE(team.team_name, '未分组') AS teamName,
+        p.created_by AS createdBy,
+        COUNT(DISTINCT a.id) AS assetCount,
+        COALESCE(ROUND(AVG(CASE WHEN t.asset_count = 0 THEN 0
+            ELSE t.completed_count * 100 / t.asset_count END)), 0) AS progress
+    </sql>
+
+    <sql id="projectListJoins">
+        FROM label_project p
+        LEFT JOIN sys_user owner ON owner.user_id = p.owner_id
+        LEFT JOIN label_team team ON team.id = p.team_id
+        LEFT JOIN label_asset a ON a.project_id = p.id AND a.deleted = 0
+        LEFT JOIN label_task t ON t.project_id = p.id AND t.deleted = 0
+    </sql>
+
+    <sql id="projectListGroup">
+        GROUP BY p.id, p.project_code, p.project_name, p.description, p.data_type,
+                 p.status, p.owner_id, p.team_id, p.start_time, p.end_time, p.create_time,
+                 owner.nick_name, owner.user_name, team.team_name
+    </sql>
+
+    <select id="selectProjects" resultType="org.dromara.label.vo.ProjectVO">
+        SELECT <include refid="projectListColumns"/>
+        <include refid="projectListJoins"/>
+        <where>
+            <choose>
+                <when test="status != null and status == 'archived'">
+                    p.deleted = 1 AND p.status = 'archived'
+                </when>
+                <otherwise>
+                    p.deleted = 0
+                    <if test="status != null and status != ''">
+                        AND p.status = #{status}
+                    </if>
+                </otherwise>
+            </choose>
+            <if test="keyword != null and keyword != ''">
+                AND (p.project_name LIKE CONCAT('%', #{keyword}, '%')
+                     OR p.project_code LIKE CONCAT('%', #{keyword}, '%')
+                     OR owner.nick_name LIKE CONCAT('%', #{keyword}, '%'))
+            </if>
+            <if test="dataType != null and dataType != ''">
+                AND p.data_type = #{dataType}
+            </if>
+            <if test="createdBy != null">
+                AND p.created_by = #{createdBy}
+            </if>
+        </where>
+        <include refid="projectListGroup"/>
+        ORDER BY p.id DESC
+    </select>
+
+    <select id="selectProjectById" resultType="org.dromara.label.vo.ProjectVO">
+        SELECT <include refid="projectListColumns"/>
+        <include refid="projectListJoins"/>
+        WHERE (p.deleted = 0 OR p.status = 'archived') AND p.id = #{id}
+        <include refid="projectListGroup"/>
+    </select>
+
+    <select id="selectProjectRow" resultType="map">
+        SELECT * FROM label_project WHERE deleted = 0 AND id = #{id}
+    </select>
+
+    <select id="selectProjectStatus" resultType="string">
+        SELECT status FROM label_project WHERE id = #{id}
+    </select>
+
+    <select id="selectProjectTeamIds" resultType="long">
+        SELECT DISTINCT team_id FROM label_project_team
+        WHERE deleted = 0 AND project_id = #{projectId} AND team_id IS NOT NULL
+    </select>
+
+    <select id="selectActiveProjectStatus" resultType="string">
+        SELECT status FROM label_project WHERE deleted = 0 AND id = #{id}
+    </select>
+
+    <select id="selectActiveUserId" resultType="long">
+        SELECT user_id FROM sys_user WHERE user_id = #{userId} AND status = '0' LIMIT 1
+    </select>
+
+    <update id="archiveProject">
+        UPDATE label_project
+        SET status = 'archived', deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="restoreProject">
+        UPDATE label_project
+        SET status = 'completed', deleted = 0, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="startProject">
+        UPDATE label_project
+        SET status = 'running', start_time = COALESCE(start_time, NOW()),
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="completeProject">
+        UPDATE label_project
+        SET status = 'completed', end_time = NOW(), updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <insert id="insertProject" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_project (
+            project_code, project_name, description, data_type, owner_id, team_id,
+            status, start_time, created_by, updated_by
+        ) VALUES (
+            #{projectCode}, #{projectName}, #{description}, #{dataType}, #{ownerId}, #{teamId},
+            #{status}, NOW(), #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="updateProject" parameterType="map">
+        UPDATE label_project
+        SET project_name = #{projectName}, description = #{description}, data_type = #{dataType},
+            owner_id = #{ownerId}, team_id = #{teamId},
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <!-- 启动校验·标签集是否已配置：文本项目的标签体系在 label_text_class_set（与视觉不共用），
+         service 按项目 data_type 分流调用对应查询。
+         文本校验查标签表而非集表：文本标签允许不挂集直接挂项目（class_set_id 可空），
+         存量数据即无集记录，标注真正依赖的是标签本身 -->
+    <select id="countClassSetByProject" resultType="long">
+        SELECT COUNT(*) FROM label_class_set WHERE project_id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="countTextClassByProject" resultType="long">
+        SELECT COUNT(*) FROM label_text_class WHERE project_id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="selectProjectDataType" resultType="string">
+        SELECT data_type FROM label_project WHERE id = #{projectId}
+    </select>
+
+    <select id="countAssetByProject" resultType="long">
+        SELECT COUNT(*) FROM label_asset WHERE project_id = #{projectId} AND deleted = 0
+    </select>
+
+    <!-- ============ 类别集 / 类别 ============ -->
+
+    <select id="selectClassSets" resultType="org.dromara.label.vo.ClassSetVO">
+        SELECT id, project_id AS projectId, name, version, status
+        FROM label_class_set
+        WHERE deleted = 0 AND project_id = #{projectId}
+        ORDER BY id DESC
+    </select>
+
+    <select id="selectClassSetById" resultType="org.dromara.label.vo.ClassSetVO">
+        SELECT id, project_id AS projectId, name, version, status
+        FROM label_class_set
+        WHERE deleted = 0 AND id = #{id}
+    </select>
+
+    <insert id="insertClassSet" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_class_set (project_id, name, version, status, created_by, updated_by)
+        VALUES (#{projectId}, #{name}, #{version}, 'active', #{userId}, #{userId})
+    </insert>
+
+    <update id="updateClassSet">
+        UPDATE label_class_set
+        SET name = COALESCE(#{name}, name),
+            version = COALESCE(#{version}, version),
+            update_time = NOW(), updated_by = #{userId}
+        WHERE id = #{id}
+    </update>
+
+    <update id="deleteClassSet">
+        UPDATE label_class_set
+        SET deleted = 1, update_time = NOW(), updated_by = #{userId}
+        WHERE id = #{id}
+    </update>
+
+    <select id="selectClasses" resultType="org.dromara.label.vo.ClassVO">
+        SELECT id, class_set_id AS classSetId, label_name AS labelName, color,
+               tool_type AS toolType,
+               default_size_l AS defaultSizeL, default_size_w AS defaultSizeW, default_size_h AS defaultSizeH,
+               is_rigid AS isRigid,
+               min_inside_points AS minInsidePoints,
+               JSON_UNQUOTE(JSON_EXTRACT(keypoint_template_json, '$')) AS keypointTemplate,
+               sort_order AS sortOrder, status
+        FROM label_class
+        WHERE deleted = 0 AND class_set_id = #{classSetId}
+        ORDER BY sort_order, id
+    </select>
+
+    <select id="selectClassById" resultType="org.dromara.label.vo.ClassVO">
+        SELECT id, class_set_id AS classSetId, label_name AS labelName, color,
+               tool_type AS toolType,
+               default_size_l AS defaultSizeL, default_size_w AS defaultSizeW, default_size_h AS defaultSizeH,
+               is_rigid AS isRigid,
+               min_inside_points AS minInsidePoints,
+               JSON_UNQUOTE(JSON_EXTRACT(keypoint_template_json, '$')) AS keypointTemplate,
+               sort_order AS sortOrder, status
+        FROM label_class
+        WHERE deleted = 0 AND id = #{id}
+    </select>
+
+    <insert id="insertClass" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_class (class_set_id, label_name, color, tool_type,
+                default_size_l, default_size_w, default_size_h, is_rigid, min_inside_points,
+                keypoint_template_json,
+                sort_order, status, created_by, updated_by)
+        VALUES (#{classSetId}, #{labelName}, #{color}, NULLIF(#{toolType}, ''),
+                #{defaultSizeL}, #{defaultSizeW}, #{defaultSizeH}, #{isRigid}, #{minInsidePoints},
+                #{keypointTemplateJson},
+                #{sortOrder}, 'active', #{userId}, #{userId})
+    </insert>
+
+    <update id="updateClass">
+        UPDATE label_class
+        SET label_name = COALESCE(#{labelName}, label_name),
+            color = COALESCE(#{color}, color),
+            tool_type = NULLIF(#{toolType}, ''),
+            default_size_l = COALESCE(#{defaultSizeL}, default_size_l),
+            default_size_w = COALESCE(#{defaultSizeW}, default_size_w),
+            default_size_h = COALESCE(#{defaultSizeH}, default_size_h),
+            is_rigid = COALESCE(#{isRigid}, is_rigid),
+            min_inside_points = COALESCE(#{minInsidePoints}, min_inside_points),
+            keypoint_template_json = COALESCE(#{keypointTemplateJson}, keypoint_template_json),
+            sort_order = COALESCE(#{sortOrder}, sort_order),
+            update_time = NOW(),
+            updated_by = #{userId}
+        WHERE id = #{id}
+    </update>
+
+    <update id="deleteClass">
+        UPDATE label_class
+        SET deleted = 1, update_time = NOW(), updated_by = #{userId}
+        WHERE id = #{id}
+    </update>
+
+    <select id="selectClassAttributes" resultType="org.dromara.label.vo.ClassAttributeVO">
+        SELECT id,
+               class_id AS classId,
+               attr_name AS attrName,
+               attr_type AS attrType,
+               JSON_UNQUOTE(JSON_EXTRACT(attr_options, '$')) AS attrOptionsJson,
+               required_flag AS required,
+               max_length AS maxLength
+        FROM label_class_attribute
+        WHERE deleted = 0 AND class_id = #{classId}
+        ORDER BY id
+    </select>
+
+    <update id="deleteClassAttributesByClass">
+        UPDATE label_class_attribute
+        SET deleted = 1, update_time = NOW(), updated_by = #{userId}
+        WHERE deleted = 0 AND class_id = #{classId}
+    </update>
+
+    <insert id="insertClassAttribute">
+        INSERT INTO label_class_attribute (
+            class_id, attr_name, attr_type, attr_options, required_flag, max_length, created_by, updated_by
+        ) VALUES (
+            #{classId}, #{attrName}, #{attrType}, #{attrOptionsJson}, #{required},
+            <choose>
+                <!-- attr_type='text' 时落 maxLength；其他类型落 NULL，避免对枚举型属性写入无意义上限 -->
+                <when test="attrType == 'text' and maxLength != null and maxLength > 0">
+                    #{maxLength}
+                </when>
+                <otherwise>NULL</otherwise>
+            </choose>,
+            #{userId}, #{userId}
+        )
+        ON DUPLICATE KEY UPDATE
+            attr_type    = VALUES(attr_type),
+            attr_options = VALUES(attr_options),
+            required_flag = VALUES(required_flag),
+            max_length   = VALUES(max_length),
+            <!-- 软删除过的同名属性再次配置时复活：否则会更新到 deleted=1 的行上，前端永远查不到 -->
+            deleted      = 0,
+            updated_by   = VALUES(updated_by),
+            update_time  = NOW()
+    </insert>
+
+    <!-- ============ 全局属性 ============ -->
+
+    <!-- 全局属性 upsert（项目维度）：同名属性幂等写入，软删过的同名属性再次配置时复活。
+         唯一键 uk_global_attr_name(project_id, attr_name)，项目之间互相隔离。 -->
+    <insert id="insertGlobalAttribute">
+        INSERT INTO label_global_attribute (
+            project_id, attr_name, attr_type, attr_options, required_flag, max_length, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{attrName}, #{attrType}, #{attrOptionsJson}, #{required},
+            <choose>
+                <when test="attrType == 'text' and maxLength != null and maxLength > 0">
+                    #{maxLength}
+                </when>
+                <otherwise>NULL</otherwise>
+            </choose>,
+            #{userId}, #{userId}
+        )
+        ON DUPLICATE KEY UPDATE
+            attr_type     = VALUES(attr_type),
+            attr_options  = VALUES(attr_options),
+            required_flag = VALUES(required_flag),
+            max_length    = VALUES(max_length),
+            deleted       = 0,
+            updated_by    = VALUES(updated_by)
+    </insert>
+
+    <select id="selectGlobalAttributes" resultType="org.dromara.label.vo.ClassAttributeVO">
+        SELECT id,
+               NULL AS classId,
+               attr_name AS attrName,
+               attr_type AS attrType,
+               JSON_UNQUOTE(JSON_EXTRACT(attr_options, '$')) AS attrOptionsJson,
+               required_flag AS required,
+               max_length AS maxLength
+        FROM label_global_attribute
+        WHERE deleted = 0 AND project_id = #{projectId}
+        ORDER BY id
+    </select>
+
+    <update id="deleteAllGlobalAttributes">
+        UPDATE label_global_attribute
+        SET deleted = 1, update_time = NOW(), updated_by = #{userId}
+        WHERE deleted = 0 AND project_id = #{projectId}
+    </update>
+
+    <!-- ============ 项目成员 ============ -->
+
+    <select id="selectProjectMembers" resultType="org.dromara.label.vo.ProjectMemberVO">
+        SELECT tm.id,
+               t.id AS teamId,
+               t.team_name AS teamName,
+               tm.user_id AS userId,
+               u.nick_name AS nickName,
+               u.user_name AS userName,
+               tm.team_role AS teamRole
+        FROM (
+            SELECT team_id AS teamId FROM label_project_team WHERE deleted = 0 AND project_id = #{projectId}
+            UNION
+            SELECT team_id AS teamId FROM label_project WHERE deleted = 0 AND id = #{projectId} AND team_id IS NOT NULL
+        ) rel
+        JOIN label_team t ON t.id = rel.teamId AND t.deleted = 0
+        JOIN label_team_member tm ON tm.team_id = t.id AND tm.deleted = 0
+        JOIN sys_user u ON u.user_id = tm.user_id
+        ORDER BY t.id, tm.id
+    </select>
+
+    <!-- ============ 数据批次 ============ -->
+
+    <sql id="batchColumns">
+        b.id,
+        b.project_id AS projectId,
+        b.batch_no AS batchNo,
+        b.batch_name AS batchName,
+        b.remark,
+        b.source_type AS sourceType,
+        b.source_path AS sourcePath,
+        b.status,
+        b.total_count AS totalCount,
+        b.success_count AS successCount,
+        b.failed_count AS failedCount,
+        b.create_time AS createTime,
+        (SELECT COUNT(*) FROM label_asset a
+          WHERE a.batch_id = b.id AND a.deleted = 0) AS assetCount,
+        (SELECT COUNT(*) FROM label_data_entry e
+          WHERE e.batch_id = b.id AND e.deleted = 0) AS entryCount,
+        (SELECT COUNT(*) FROM label_upload u
+          WHERE u.batch_id = b.id AND u.deleted = 0) AS uploadCount,
+        (SELECT COUNT(*) FROM label_sequence s
+          WHERE s.batch_id = b.id AND s.deleted = 0) AS sequenceCount
+    </sql>
+
+    <select id="selectAssetBatches" resultType="org.dromara.label.vo.AssetBatchVO">
+        SELECT <include refid="batchColumns"/>
+        FROM label_asset_batch b
+        WHERE b.deleted = 0
+        <if test="projectId != null">
+            AND b.project_id = #{projectId}
+        </if>
+        ORDER BY b.id DESC
+    </select>
+
+    <select id="selectAssetBatchById" resultType="org.dromara.label.vo.AssetBatchVO">
+        SELECT <include refid="batchColumns"/>
+        FROM label_asset_batch b
+        WHERE b.deleted = 0 AND b.id = #{id}
+    </select>
+
+    <insert id="insertAssetBatch" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_asset_batch (
+            project_id, batch_no, batch_name, remark, source_type, status, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchNo}, #{batchName}, #{remark}, #{sourceType}, 'waiting', #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="updateAssetBatch">
+        UPDATE label_asset_batch
+        SET batch_name = #{batchName},
+            remark = #{remark},
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <update id="deleteAssetBatch">
+        UPDATE label_asset_batch
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <select id="countAssetByBatch" resultType="long">
+        SELECT COUNT(*) FROM label_asset WHERE batch_id = #{batchId} AND deleted = 0
+    </select>
+
+    <select id="countSequenceByBatch" resultType="long">
+        SELECT COUNT(*) FROM label_sequence WHERE batch_id = #{batchId} AND deleted = 0
+    </select>
+
+    <update id="deleteAssetsByBatch">
+        UPDATE label_asset
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE batch_id = #{batchId} AND deleted = 0
+    </update>
+
+    <update id="deleteSequencesByBatch">
+        UPDATE label_sequence
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE batch_id = #{batchId} AND deleted = 0
+    </update>
+
+    <!-- ============ 资产 ============ -->
+
+    <sql id="assetWhere">
+        <where>
+            deleted = 0
+            <if test="projectId != null">
+                AND project_id = #{projectId}
+            </if>
+            <if test="batchId != null">
+                AND batch_id = #{batchId}
+            </if>
+            <if test="uploadId != null">
+                AND upload_id = #{uploadId}
+            </if>
+            <if test="entryId != null">
+                AND entry_id = #{entryId}
+            </if>
+            <if test="mediaType != null and mediaType != ''">
+                AND media_type = #{mediaType}
+            </if>
+            <if test="parseStatus != null and parseStatus != ''">
+                AND parse_status = #{parseStatus}
+            </if>
+        </where>
+    </sql>
+
+    <select id="countAssets" resultType="long">
+        SELECT COUNT(*) FROM label_asset
+        <include refid="assetWhere"/>
+    </select>
+
+    <select id="selectAssets" resultType="org.dromara.label.vo.AssetVO">
+        SELECT id,
+               project_id AS projectId,
+               batch_id AS batchId,
+               upload_id AS uploadId,
+               entry_id AS entryId,
+               media_type AS mediaType,
+               file_name AS fileName,
+               file_url AS fileUrl,
+               thumbnail_url AS thumbnailUrl,
+               CONCAT(ROUND(file_size / 1048576, 1), ' MB') AS fileSize,
+               parse_status AS parseStatus,
+               status,
+               create_time AS createTime
+        FROM label_asset
+        <include refid="assetWhere"/>
+        ORDER BY id DESC
+        <if test="limit > 0">
+            LIMIT #{limit} OFFSET #{offset}
+        </if>
+    </select>
+
+    <select id="selectAssetById" resultType="org.dromara.label.vo.AssetVO">
+        SELECT id,
+               project_id AS projectId,
+               batch_id AS batchId,
+               upload_id AS uploadId,
+               entry_id AS entryId,
+               media_type AS mediaType,
+               file_name AS fileName,
+               file_url AS fileUrl,
+               thumbnail_url AS thumbnailUrl,
+               CONCAT(ROUND(file_size / 1048576, 1), ' MB') AS fileSize,
+               parse_status AS parseStatus,
+               status,
+               create_time AS createTime
+        FROM label_asset
+        WHERE deleted = 0 AND id = #{id}
+    </select>
+
+    <update id="retryAsset">
+        UPDATE label_asset
+        SET parse_status = 'parsed', status = 'available', updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <insert id="insertAsset" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_asset (
+            project_id, batch_id, upload_id, media_type, file_name, file_url, thumbnail_url,
+            file_size, width, height, parse_status, status, meta_json, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadId}, #{mediaType}, #{fileName}, #{fileUrl}, #{thumbnailUrl},
+            #{fileSize}, #{width}, #{height}, 'parsed', 'available', #{metaJson}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="bumpAssetBatch">
+        UPDATE label_asset_batch
+        SET total_count = total_count + 1,
+            success_count = success_count + 1,
+            status = 'parsed',
+            update_time = NOW()
+        WHERE id = #{batchId}
+    </update>
+
+    <!-- ============ 上传数据（批次下的独立上传单元） ============ -->
+
+    <sql id="uploadColumns">
+        u.id,
+        u.project_id AS projectId,
+        u.batch_id AS batchId,
+        u.upload_no AS uploadNo,
+        u.file_name AS fileName,
+        u.file_size AS fileSize,
+        u.object_name AS objectName,
+        u.source_type AS sourceType,
+        u.status,
+        u.remark,
+        u.create_time AS createTime,
+        COALESCE(usr.nick_name, usr.user_name) AS createByName,
+        (SELECT COUNT(*) FROM label_asset a
+          WHERE a.upload_id = u.id AND a.deleted = 0) AS assetCount,
+        (SELECT COUNT(*) FROM label_data_entry e
+          WHERE e.upload_id = u.id AND e.deleted = 0) AS entryCount
+    </sql>
+
+    <select id="selectUploadsByBatch" resultType="org.dromara.label.vo.UploadDataVO">
+        SELECT <include refid="uploadColumns"/>
+        FROM label_upload u
+        LEFT JOIN sys_user usr ON usr.user_id = u.created_by
+        WHERE u.deleted = 0 AND u.batch_id = #{batchId}
+        ORDER BY u.id DESC
+    </select>
+
+    <select id="selectUploadById" resultType="org.dromara.label.vo.UploadDataVO">
+        SELECT <include refid="uploadColumns"/>
+        FROM label_upload u
+        LEFT JOIN sys_user usr ON usr.user_id = u.created_by
+        WHERE u.deleted = 0 AND u.id = #{id}
+    </select>
+
+    <select id="selectLatestUploadId" resultType="long">
+        SELECT u.id
+        FROM label_upload u
+        WHERE u.deleted = 0
+          AND u.project_id = #{projectId}
+          AND u.batch_id = #{batchId}
+          AND u.file_name = #{fileName}
+          AND u.source_type = #{sourceType}
+        ORDER BY u.id DESC
+        LIMIT 1
+    </select>
+
+    <insert id="insertUpload" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_upload (
+            project_id, batch_id, upload_no, file_name, file_size, object_name,
+            source_type, asset_count, status, remark, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadNo}, #{fileName}, #{fileSize}, #{objectName},
+            #{sourceType}, 0, #{status}, #{remark}, #{userId}, #{userId}
+        )
+    </insert>
+
+    <!-- 上传编号回填：upload_no = UPLOAD-自增id，唯一性由主键保证（并发上传不再撞 uk_upload_no） -->
+    <update id="updateUploadNo">
+        UPDATE label_upload SET upload_no = CONCAT('UPLOAD-', id) WHERE id = #{id}
+    </update>
+
+    <select id="countAssetByUpload" resultType="long">
+        SELECT COUNT(*) FROM label_asset WHERE upload_id = #{uploadId} AND deleted = 0
+    </select>
+
+    <update id="refreshUploadAssetCount">
+        UPDATE label_upload u
+        SET u.asset_count = (SELECT COUNT(*) FROM label_asset a
+                             WHERE a.upload_id = u.id AND a.deleted = 0),
+            u.update_time = NOW()
+        WHERE u.id = #{uploadId}
+    </update>
+
+    <update id="deleteUpload">
+        UPDATE label_upload
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <update id="deleteUploadsByBatch">
+        UPDATE label_upload
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE batch_id = #{batchId} AND deleted = 0
+    </update>
+
+    <update id="deleteAssetsByUpload">
+        UPDATE label_asset
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE upload_id = #{uploadId} AND deleted = 0
+    </update>
+
+    <!-- ============ 数据条目（上传数据下的数据集合包） ============ -->
+
+    <sql id="dataEntryColumns">
+        e.id,
+        e.project_id AS projectId,
+        e.batch_id AS batchId,
+        COALESCE(b.batch_name, b.batch_no) AS batchName,
+        e.upload_id AS uploadId,
+        u.upload_no AS uploadNo,
+        u.file_name AS uploadName,
+        e.source_file AS sourceFile,
+        e.entry_no AS entryNo,
+        e.entry_name AS entryName,
+        e.seq_no AS seqNo,
+        e.asset_count AS assetCount,
+        e.split_mode AS splitMode,
+        e.task_id AS taskId,
+        e.label_status AS labelStatus,
+        e.review_status AS reviewStatus,
+        e.review_round AS reviewRound,
+        e.assignee_id AS assigneeId,
+        COALESCE(sa.nick_name, sa.user_name) AS assigneeName,
+        e.reviewer_id AS reviewerId,
+        COALESCE(sr.nick_name, sr.user_name) AS reviewerName,
+        e.reject_count AS rejectCount,
+        e.assign_time AS assignTime,
+        e.review_time AS reviewTime,
+        e.create_time AS createTime,
+        e.update_time AS updateTime
+    </sql>
+
+    <sql id="dataEntryFrom">
+        FROM label_data_entry e
+        LEFT JOIN label_upload u ON u.id = e.upload_id
+        LEFT JOIN label_asset_batch b ON b.id = e.batch_id
+        LEFT JOIN sys_user sa ON sa.user_id = e.assignee_id
+        LEFT JOIN sys_user sr ON sr.user_id = e.reviewer_id
+    </sql>
+
+    <select id="selectEntriesByUpload" resultType="org.dromara.label.vo.DataEntryVO">
+        SELECT <include refid="dataEntryColumns"/>
+        <include refid="dataEntryFrom"/>
+        WHERE e.deleted = 0 AND e.upload_id = #{uploadId}
+        ORDER BY e.seq_no, e.id
+    </select>
+
+    <select id="selectDataEntryById" resultType="org.dromara.label.vo.DataEntryVO">
+        SELECT <include refid="dataEntryColumns"/>
+        <include refid="dataEntryFrom"/>
+        WHERE e.deleted = 0 AND e.id = #{id}
+    </select>
+
+    <select id="selectDefaultEntryIdByUpload" resultType="long">
+        SELECT e.id FROM label_data_entry e
+        WHERE e.deleted = 0 AND e.upload_id = #{uploadId} AND e.split_mode = 'whole'
+        ORDER BY e.id
+        LIMIT 1
+    </select>
+
+    <select id="selectLastEntryIdByUpload" resultType="long">
+        SELECT e.id FROM label_data_entry e
+        WHERE e.deleted = 0 AND e.upload_id = #{uploadId}
+        ORDER BY e.seq_no DESC, e.id DESC
+        LIMIT 1
+    </select>
+
+    <!-- 项目内条目号最大序号：entry_no 形如 ENTRY-12，取最后一段数字比较；
+         不加 deleted 条件，软删除的号码也不复用（uk_project_entry_no 不区分删除标记）。
+         FOR UPDATE = 锁定读（当前读）：RR 隔离级别下普通 SELECT 是快照读，
+         并发导入时对方已提交的新号不可见，重试会永远取到旧号撞唯一键（生产已复现）；
+         锁定读既能看到最新已提交数据，又把同项目取号串行化。 -->
+    <select id="selectMaxEntryNoSeq" resultType="java.lang.Long">
+        SELECT COALESCE(MAX(CAST(SUBSTRING_INDEX(e.entry_no, '-', -1) AS UNSIGNED)), 0)
+        FROM label_data_entry e
+        WHERE e.project_id = #{projectId} AND e.entry_no LIKE 'ENTRY-%'
+        FOR UPDATE
+    </select>
+
+    <select id="selectAssetIdsByUpload" resultType="long">
+        SELECT a.id FROM label_asset a
+        WHERE a.deleted = 0 AND a.upload_id = #{uploadId}
+        ORDER BY a.id
+    </select>
+
+    <insert id="insertDataEntry" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_data_entry (
+            project_id, batch_id, upload_id, entry_no, entry_name, source_file, seq_no, asset_count, split_mode,
+            task_id, label_status, review_status, review_round, reject_count, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadId}, #{entryNo}, #{entryName}, #{sourceFile}, #{seqNo}, 0, #{splitMode},
+            #{taskId}, 'pending', 'none', 0, 0, #{userId}, #{userId}
+        )
+    </insert>
+
+    <select id="selectTaskIdByBatch" resultType="long">
+        SELECT tb.task_id FROM label_task_batch tb
+        WHERE tb.batch_id = #{batchId} AND tb.deleted = 0
+        ORDER BY tb.id
+        LIMIT 1
+    </select>
+
+    <update id="assignAssetToEntry">
+        UPDATE label_asset
+        SET entry_id = #{entryId}, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND id = #{assetId}
+    </update>
+
+    <update id="bindAssetsToEntry">
+        UPDATE label_asset
+        SET entry_id = #{entryId}, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND id IN
+        <foreach collection="assetIds" item="assetId" open="(" separator="," close=")">
+            #{assetId}
+        </foreach>
+    </update>
+
+    <update id="clearAssetEntryByUpload">
+        UPDATE label_asset
+        SET entry_id = NULL, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND upload_id = #{uploadId}
+    </update>
+
+    <!--
+      单文件/文件夹点云上传增量归入：取该上传下最近一个「点云资产数 < maxFrames」的点云标注条目；
+      不存在（全满或尚无条目）则返回 null，由调用方新建条目。避免每次上传整体重建条目。
+    -->
+    <select id="selectLastOpenPointCloudEntry" resultType="long">
+        SELECT e.id
+        FROM label_data_entry e
+        WHERE e.upload_id = #{uploadId} AND e.deleted = 0
+          AND (SELECT COUNT(*) FROM label_asset a
+               WHERE a.entry_id = e.id AND a.deleted = 0 AND a.media_type = 'point_cloud') &lt; #{maxFrames}
+        ORDER BY e.seq_no DESC, e.id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectMaxEntrySeqNo" resultType="int">
+        SELECT COALESCE(MAX(seq_no), 0) FROM label_data_entry
+        WHERE upload_id = #{uploadId} AND deleted = 0
+    </select>
+
+    <!--
+      批次维度点云未满条目：前端逐文件上传时每个文件各自是一个上传数据，
+      但点云应按批次聚合成「最多 60 个一条目」，故查找范围取整个批次（跨 upload）。
+    -->
+    <select id="selectLastOpenPointCloudEntryByBatch" resultType="long">
+        SELECT e.id
+        FROM label_data_entry e
+        WHERE e.batch_id = #{batchId} AND e.deleted = 0
+          AND (SELECT COUNT(*) FROM label_asset a
+               WHERE a.entry_id = e.id AND a.deleted = 0 AND a.media_type = 'point_cloud') &lt; #{maxFrames}
+        ORDER BY e.seq_no DESC, e.id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectMaxEntrySeqNoByBatch" resultType="int">
+        SELECT COALESCE(MAX(seq_no), 0) FROM label_data_entry
+        WHERE batch_id = #{batchId} AND deleted = 0
+    </select>
+
+    <!--
+      上传数据下点云资产ID：仅点云（标注资源）作为「帧」切分标注条目；
+      无点云（纯图片）时退化为全部资产。
+    -->
+    <select id="selectPointCloudAssetIdsByUpload" resultType="long">
+        SELECT id FROM label_asset
+        WHERE upload_id = #{uploadId} AND deleted = 0 AND media_type = 'point_cloud'
+        ORDER BY id
+    </select>
+
+    <!--
+      nuScenes 导入：点云按帧切分为标注条目后，把同帧相机图按 label_nuscenes_asset_map
+      归到其点云所在条目下（作为参考资产，不进入标注作业）。仅更新相机图，不动点云/条目的标注归属。
+    -->
+    <update id="bindCameraImagesToPointCloudEntry">
+        UPDATE label_asset cam
+        JOIN label_nuscenes_asset_map m ON m.camera_asset_id = cam.id AND m.upload_id = #{uploadId}
+        JOIN label_asset pc ON pc.id = m.asset_id
+        SET cam.entry_id = pc.entry_id, cam.updated_by = #{userId}, cam.update_time = NOW()
+        WHERE cam.deleted = 0 AND pc.deleted = 0 AND pc.entry_id IS NOT NULL
+    </update>
+
+    <!--
+      兜底：上传数据下仍有未归属条目的相机图（无匹配点云/元数据缺失）归入该上传首个点云条目，
+      保证其在数据视图可见、不至于成为孤儿资产；点云任务下仍不进入标注作业。
+    -->
+    <update id="bindOrphanImagesToFirstPointCloudEntry">
+        UPDATE label_asset cam
+        SET cam.entry_id = (
+                SELECT MIN(entry_id) FROM label_asset
+                WHERE upload_id = #{uploadId} AND deleted = 0
+                  AND media_type = 'point_cloud' AND entry_id IS NOT NULL),
+            cam.updated_by = #{userId}, cam.update_time = NOW()
+        WHERE cam.upload_id = #{uploadId} AND cam.deleted = 0
+          AND cam.media_type = 'image' AND cam.entry_id IS NULL
+          AND EXISTS (SELECT 1 FROM label_asset
+                      WHERE upload_id = #{uploadId} AND deleted = 0
+                        AND media_type = 'point_cloud' AND entry_id IS NOT NULL)
+    </update>
+
+    <update id="refreshDataEntryAssetCountByUpload">
+        UPDATE label_data_entry e
+        SET e.asset_count = (SELECT COUNT(*) FROM label_asset a
+                             WHERE a.entry_id = e.id AND a.deleted = 0),
+            e.update_time = NOW()
+        WHERE e.deleted = 0 AND e.upload_id = #{uploadId}
+    </update>
+
+    <!--
+      ============ 条目数据资产信息冗余列刷新（media_type / parse_status / first_asset_id） ============
+      语义与列表页原相关子查询完全一致：
+        media_type     未删资产媒体类型去重后超一种为 mixed（#{mixedMediaType}），无资产为 NULL；
+        parse_status   任一未删资产为 failed（#{failedStatus}）则 failed，否则 success
+                       （#{successStatus}，含无资产条目）；
+        first_asset_id id 最小的未删资产，供列表 LEFT JOIN 取 fileUrl / thumbnailUrl。
+      聚合表达式集中在本片段，两条入口（按 upload / 按 asset）复用。
+    -->
+    <sql id="entryAssetInfoSet">
+        e.media_type = (
+            SELECT CASE WHEN COUNT(DISTINCT a.media_type) > 1 THEN #{mixedMediaType}
+                        ELSE MIN(a.media_type) END
+            FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0
+        ),
+        e.parse_status = (
+            SELECT CASE WHEN SUM(a.parse_status = #{failedStatus}) > 0 THEN #{failedStatus}
+                        ELSE #{successStatus} END
+            FROM label_asset a WHERE a.entry_id = e.id AND a.deleted = 0
+        ),
+        e.first_asset_id = (
+            SELECT a.id FROM label_asset a
+            WHERE a.entry_id = e.id AND a.deleted = 0 ORDER BY a.id LIMIT 1
+        ),
+        e.update_time = NOW()
+    </sql>
+
+    <!-- 按上传数据维度：splitUploadEntries / attachAssetsToDefaultEntry 末尾调用，覆盖该上传下全部条目。 -->
+    <update id="refreshEntryAssetInfoByUpload">
+        UPDATE label_data_entry e
+        SET <include refid="entryAssetInfoSet"/>
+        WHERE e.deleted = 0 AND e.upload_id = #{uploadId}
+    </update>
+
+    <!--
+      按资产维度：retryAsset 等单资产状态变更后调用，重算其所属条目。
+      资产未归属任何条目（entry_id 为 NULL）时不命中任何行，幂等无副作用。
+    -->
+    <update id="refreshEntryAssetInfoByAssetId">
+        UPDATE label_data_entry e
+        SET <include refid="entryAssetInfoSet"/>
+        WHERE e.deleted = 0
+          AND e.id = (SELECT a.entry_id FROM label_asset a WHERE a.id = #{assetId})
+    </update>
+
+    <update id="deleteDataEntriesByUpload">
+        UPDATE label_data_entry
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND upload_id = #{uploadId}
+    </update>
+
+    <update id="deleteDataEntriesByBatch">
+        UPDATE label_data_entry
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND batch_id = #{batchId}
+    </update>
+
+    <select id="countAssignedAssetByUpload" resultType="long">
+        SELECT COUNT(*) FROM label_asset a
+        WHERE a.deleted = 0 AND a.upload_id = #{uploadId}
+          AND (a.task_id IS NOT NULL
+               OR EXISTS (SELECT 1 FROM label_data_entry e
+                          WHERE e.deleted = 0 AND e.upload_id = #{uploadId} AND e.task_id IS NOT NULL))
+    </select>
+
+</mapper>

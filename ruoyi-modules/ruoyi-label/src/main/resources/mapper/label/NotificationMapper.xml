@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.NotificationMapper">
+
+    <select id="selectNotifications" resultType="org.dromara.label.vo.NotificationVO">
+        SELECT id, title, content, biz_type AS bizType, biz_id AS bizId,
+               read_status = 1 AS `read`, create_time AS createTime
+        FROM sys_notification
+        WHERE user_id = #{userId}
+        ORDER BY id DESC
+    </select>
+
+    <select id="selectNotification" resultType="org.dromara.label.vo.NotificationVO">
+        SELECT id, title, content, biz_type AS bizType, biz_id AS bizId,
+               read_status = 1 AS `read`, create_time AS createTime
+        FROM sys_notification
+        WHERE id = #{id}
+    </select>
+
+    <select id="countUnread" resultType="long">
+        SELECT COUNT(*) FROM sys_notification WHERE user_id = #{userId} AND read_status = 0
+    </select>
+
+    <update id="updateRead">
+        UPDATE sys_notification SET read_status = 1, update_time = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateAllRead">
+        UPDATE sys_notification SET read_status = 1, update_time = NOW() WHERE user_id = #{userId}
+    </update>
+</mapper>

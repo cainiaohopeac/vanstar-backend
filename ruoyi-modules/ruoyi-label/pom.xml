@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <parent>
+        <groupId>org.dromara</groupId>
+        <artifactId>ruoyi-modules</artifactId>
+        <version>${revision}</version>
+    </parent>
+    <modelVersion>4.0.0</modelVersion>
+
+    <artifactId>ruoyi-label</artifactId>
+
+    <description>
+        ruoyi-label 标注平台业务模块（自旧 label_server 平台迁移）
+    </description>
+
+    <dependencies>
+        <!-- RuoYi 通用核心 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-core</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-mybatis</artifactId>
+        </dependency>
+
+        <!-- Sa-Token 权限 / 登录用户上下文 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-satoken</artifactId>
+        </dependency>
+
+        <!-- 操作日志 -->
+        <dependency>
+            <groupId>org.dromara</groupId>
+            <artifactId>ruoyi-common-log</artifactId>
+        </dependency>
+
+        <!-- MinIO 对象存储（与 RuoYi OSS 共用同一 MinIO 实例） -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+            <version>8.5.17</version>
+        </dependency>
+
+        <!-- Apache POI：文本标注导入 .docx 时提取正文（.txt/.json/.csv 无需此依赖）。
+             6.0.0 要求 JDK 17，与本项目编译目标一致；poi-ooxml 已传递依赖 poi 与 poi-ooxml-lite。 -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>6.0.0</version>
+        </dependency>
+    </dependencies>
+
+</project>

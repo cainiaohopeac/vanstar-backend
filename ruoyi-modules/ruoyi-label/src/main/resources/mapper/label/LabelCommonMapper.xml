@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.LabelCommonMapper">
+
+    <select id="countJobs" resultType="long">
+        SELECT COUNT(*) FROM label_job WHERE deleted = 0 AND status = #{status}
+    </select>
+
+    <!-- 仅内部白名单调用方传入固定表名（label_job/label_task/label_project/label_asset_batch 等） -->
+    <select id="nextId" resultType="long">
+        SELECT COALESCE(MAX(id), 0) + 1 FROM ${tableName}
+    </select>
+
+    <insert id="insertNotification">
+        INSERT INTO sys_notification (user_id, title, content, biz_type, biz_id, read_status)
+        VALUES (#{userId}, #{title}, #{content}, #{bizType}, #{bizId}, 0)
+    </insert>
+
+    <select id="findUserIdByName" resultType="long">
+        SELECT user_id FROM sys_user
+        WHERE user_name = #{name} OR nick_name = #{name}
+        LIMIT 1
+    </select>
+
+    <select id="findProjectIdByName" resultType="long">
+        SELECT id FROM label_project WHERE project_name = #{projectName} AND deleted = 0 LIMIT 1
+    </select>
+
+    <select id="findTaskIdByName" resultType="long">
+        SELECT id FROM label_task WHERE task_name = #{taskName} AND deleted = 0 LIMIT 1
+    </select>
+
+    <select id="findAssigneeIdByJobId" resultType="long">
+        SELECT assignee_id FROM label_job WHERE id = #{jobId}
+    </select>
+
+    <select id="findReviewerIdByJobId" resultType="long">
+        SELECT reviewer_id FROM label_job WHERE id = #{jobId}
+    </select>
+
+    <select id="firstClassSetId" resultType="long">
+        SELECT id FROM label_class_set
+        WHERE project_id = #{projectId} AND deleted = 0
+        ORDER BY id
+        LIMIT 1
+    </select>
+
+    <select id="lastAssetBatchId" resultType="long">
+        SELECT id FROM label_asset_batch
+        WHERE project_id = #{projectId} AND deleted = 0
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <insert id="insertAssetBatch">
+        INSERT INTO label_asset_batch (
+            project_id, batch_no, batch_name, source_type, status, created_by, updated_by
+        ) VALUES (#{projectId}, #{batchNo}, #{batchName}, 'upload', 'parsed', #{userId}, #{userId})
+    </insert>
+
+    <select id="selectBatchIdByNo" resultType="long">
+        SELECT id FROM label_asset_batch
+        WHERE project_id = #{projectId} AND batch_no = #{batchNo} AND deleted = 0
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectBatchProjectId" resultType="long">
+        SELECT project_id FROM label_asset_batch
+        WHERE id = #{batchId} AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <update id="touchAssetBatch">
+        UPDATE label_asset_batch
+        SET status = 'parsed', update_time = NOW()
+        WHERE id = #{batchId} AND deleted = 0
+    </update>
+
+    <select id="assetIdByJobAsset" resultType="long">
+        SELECT asset_id FROM label_job_asset
+        WHERE job_id = #{jobId}
+        ORDER BY sort_order, id
+        LIMIT 1
+    </select>
+
+    <select id="selectJobProjectId" resultType="long">
+        SELECT project_id FROM label_job WHERE id = #{jobId}
+    </select>
+
+    <select id="selectJobDataType" resultType="string">
+        SELECT data_type FROM label_job WHERE id = #{jobId}
+    </select>
+
+    <select id="firstAssetIdOfProject" resultType="long">
+        SELECT id FROM label_asset
+        WHERE project_id = #{projectId} AND media_type = #{mediaType} AND deleted = 0
+        ORDER BY id
+        LIMIT 1
+    </select>
+
+    <select id="teamIdByName" resultType="long">
+        SELECT id FROM label_team WHERE team_name = #{teamName} AND deleted = 0 LIMIT 1
+    </select>
+
+    <insert id="insertTeam">
+        INSERT INTO label_team (team_name, leader_id, status, created_by, updated_by)
+        VALUES (#{teamName}, #{userId}, 'active', #{userId}, #{userId})
+    </insert>
+
+    <select id="selectValidTeamIds" resultType="long">
+        SELECT id FROM label_team
+        WHERE deleted = 0 AND id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </select>
+
+    <delete id="deleteProjectTeams">
+        DELETE FROM label_project_team WHERE project_id = #{projectId}
+    </delete>
+
+    <insert id="insertProjectTeam">
+        INSERT INTO label_project_team (project_id, team_id, created_by, updated_by)
+        VALUES (#{projectId}, #{teamId}, #{userId}, #{userId})
+    </insert>
+
+    <update id="updateProjectPrimaryTeam">
+        UPDATE label_project
+        SET team_id = #{teamId}, updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{projectId}
+    </update>
+
+    <select id="selectProjectTeams" resultType="map">
+        SELECT pt.project_id AS projectId,
+               pt.team_id AS teamId,
+               team.team_name AS teamName
+        FROM label_project_team pt
+        JOIN label_team team ON team.id = pt.team_id AND team.deleted = 0
+        WHERE pt.deleted = 0 AND pt.project_id IN
+        <foreach collection="ids" item="pid" open="(" separator="," close=")">
+            #{pid}
+        </foreach>
+        ORDER BY team.id
+    </select>
+
+    <insert id="upsertTeamMember">
+        INSERT INTO label_team_member (team_id, user_id, team_role, created_by, updated_by)
+        VALUES (#{teamId}, #{userId}, #{role}, #{operator}, #{operator})
+        ON DUPLICATE KEY UPDATE team_role = VALUES(team_role), deleted = 0, update_time = NOW()
+    </insert>
+
+    <select id="countUserRole" resultType="int">
+        SELECT COUNT(*)
+        FROM sys_user_role ur
+        JOIN sys_role r ON r.role_id = ur.role_id AND r.del_flag = '0' AND r.status = '0'
+        WHERE ur.user_id = #{userId} AND r.role_key = #{roleKey}
+    </select>
+
+</mapper>

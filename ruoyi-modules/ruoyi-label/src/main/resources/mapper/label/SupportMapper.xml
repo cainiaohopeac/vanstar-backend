@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.SupportMapper">
+
+    <select id="selectUsers" resultType="org.dromara.label.vo.LabelUserVO">
+        SELECT DISTINCT u.user_id AS userId,
+               u.user_name AS userName,
+               u.nick_name AS nickName
+        FROM sys_user u
+        <if test="roleKey != null and roleKey != ''">
+            JOIN sys_user_role ur ON ur.user_id = u.user_id
+            JOIN sys_role r ON r.role_id = ur.role_id AND r.del_flag = '0' AND r.status = '0'
+        </if>
+        <where>
+            u.status = '0'
+            <if test="roleKey != null and roleKey != ''">
+                AND r.role_key = #{roleKey}
+            </if>
+            <if test="keyword != null and keyword != ''">
+                AND (u.user_name LIKE CONCAT('%', #{keyword}, '%')
+                     OR u.nick_name LIKE CONCAT('%', #{keyword}, '%'))
+            </if>
+        </where>
+        ORDER BY u.user_id ASC
+    </select>
+
+    <select id="selectOperationLogs" resultType="org.dromara.label.vo.OperationLogVO">
+        SELECT log.id,
+               log.action,
+               COALESCE(u.nick_name, u.user_name, '系统') AS operator,
+               CONCAT(log.target_type, '#', log.target_id) AS target,
+               log.create_time AS createTime
+        FROM sys_operation_log log
+        LEFT JOIN sys_user u ON u.user_id = log.user_id
+        ORDER BY log.id DESC
+    </select>
+</mapper>

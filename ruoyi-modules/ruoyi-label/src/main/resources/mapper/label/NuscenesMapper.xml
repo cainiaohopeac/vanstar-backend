@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.NuscenesMapper">
+
+    <!-- ============ 元数据归档 ============ -->
+
+    <insert id="insertMeta" parameterType="org.dromara.label.entity.LabelNuscenesMeta"
+            useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_nuscenes_meta (
+            project_id, batch_id, upload_id, version_dir, meta_object_key, status, remark,
+            created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{uploadId}, #{versionDir}, #{metaObjectKey}, #{status}, #{remark},
+            #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="updateMetaStatus" parameterType="org.dromara.label.entity.LabelNuscenesMeta">
+        UPDATE label_nuscenes_meta
+        SET status = #{status},
+            remark = #{remark},
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0
+    </update>
+
+    <select id="selectMetaByUploadId" resultType="org.dromara.label.entity.LabelNuscenesMeta">
+        SELECT id,
+               project_id AS projectId,
+               batch_id AS batchId,
+               upload_id AS uploadId,
+               version_dir AS versionDir,
+               meta_object_key AS metaObjectKey,
+               status,
+               remark,
+               create_time AS createTime,
+               update_time AS updateTime
+        FROM label_nuscenes_meta
+        WHERE deleted = 0 AND upload_id = #{uploadId}
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <!-- ============ 点云-相机关联 ============ -->
+
+    <insert id="insertAssetMaps" parameterType="java.util.List">
+        INSERT INTO label_nuscenes_asset_map (
+            project_id, upload_id, asset_id, sample_token, sample_data_token,
+            camera_file_url, camera_asset_id, camera_channel,
+            camera_intrinsic, camera_rotation, camera_translation, camera_width, camera_height,
+            lidar_rotation, lidar_translation, ego_rotation, ego_translation,
+            created_by, updated_by
+        ) VALUES
+        <foreach collection="list" item="item" separator=",">
+            (#{item.projectId}, #{item.uploadId}, #{item.assetId}, #{item.sampleToken}, #{item.sampleDataToken},
+             #{item.cameraFileUrl}, #{item.cameraAssetId}, #{item.cameraChannel},
+             #{item.cameraIntrinsic}, #{item.cameraRotation}, #{item.cameraTranslation},
+             #{item.cameraWidth}, #{item.cameraHeight},
+             #{item.lidarRotation}, #{item.lidarTranslation},
+             #{item.egoRotation}, #{item.egoTranslation},
+             #{item.userId}, #{item.userId})
+        </foreach>
+    </insert>
+
+    <update id="softDeleteAssetMapsByUploadId">
+        UPDATE label_nuscenes_asset_map
+        SET deleted = 1, updated_by = #{userId}, update_time = NOW()
+        WHERE deleted = 0 AND upload_id = #{uploadId}
+    </update>
+
+    <select id="selectMapsByUploadId" resultType="org.dromara.label.entity.LabelNuscenesAssetMap">
+        SELECT m.id,
+               m.project_id AS projectId,
+               m.upload_id AS uploadId,
+               m.asset_id AS assetId,
+               m.sample_token AS sampleToken,
+               m.sample_data_token AS sampleDataToken,
+               m.camera_file_url AS cameraFileUrl,
+               m.camera_asset_id AS cameraAssetId,
+               m.camera_channel AS cameraChannel,
+               ca.file_name AS cameraFileName,
+               m.camera_intrinsic AS cameraIntrinsic,
+               m.camera_rotation AS cameraRotation,
+               m.camera_translation AS cameraTranslation,
+               m.camera_width AS cameraWidth,
+               m.camera_height AS cameraHeight,
+               m.lidar_rotation AS lidarRotation,
+               m.lidar_translation AS lidarTranslation,
+               m.ego_rotation AS egoRotation,
+               m.ego_translation AS egoTranslation
+        FROM label_nuscenes_asset_map m
+        LEFT JOIN label_asset ca ON ca.id = m.camera_asset_id AND ca.deleted = 0
+        WHERE m.deleted = 0 AND m.upload_id = #{uploadId}
+        ORDER BY m.asset_id, m.camera_channel, m.id
+    </select>
+
+    <select id="selectMapsByAssetIds" resultType="org.dromara.label.entity.LabelNuscenesAssetMap">
+        SELECT m.id,
+               m.project_id AS projectId,
+               m.upload_id AS uploadId,
+               m.asset_id AS assetId,
+               m.sample_token AS sampleToken,
+               m.sample_data_token AS sampleDataToken,
+               m.camera_file_url AS cameraFileUrl,
+               m.camera_asset_id AS cameraAssetId,
+               m.camera_channel AS cameraChannel,
+               ca.file_name AS cameraFileName,
+               m.camera_intrinsic AS cameraIntrinsic,
+               m.camera_rotation AS cameraRotation,
+               m.camera_translation AS cameraTranslation,
+               m.camera_width AS cameraWidth,
+               m.camera_height AS cameraHeight,
+               m.lidar_rotation AS lidarRotation,
+               m.lidar_translation AS lidarTranslation,
+               m.ego_rotation AS egoRotation,
+               m.ego_translation AS egoTranslation
+        FROM label_nuscenes_asset_map m
+        LEFT JOIN label_asset ca ON ca.id = m.camera_asset_id AND ca.deleted = 0
+        WHERE m.deleted = 0
+          AND m.asset_id IN
+        <foreach collection="assetIds" item="assetId" open="(" separator="," close=")">
+            #{assetId}
+        </foreach>
+        ORDER BY m.asset_id, m.camera_channel, m.id
+    </select>
+</mapper>

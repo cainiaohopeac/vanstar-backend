@@ -1,0 +1,418 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.ExportMapper">
+
+    <!-- 合格数据资产过滤条件：条目标注完成且通过全部审核节点（任务进入「合格数据」节点后沉淀） -->
+    <sql id="qualifiedEntryFilter">
+        en.label_status IN ('labeled', 'revised')
+        AND en.review_status = 'passed'
+    </sql>
+
+    <select id="selectExports" resultType="org.dromara.label.vo.ExportJobVO">
+        SELECT e.id,
+               e.project_id AS projectId,
+               p.project_name AS projectName,
+               e.batch_id AS batchId,
+               COALESCE(bb.batch_name, bb.batch_no) AS batchName,
+               e.export_format AS format,
+               e.status,
+               COALESCE(
+                 JSON_UNQUOTE(JSON_EXTRACT(e.param_json, '$.assetCount')),
+                 (SELECT COUNT(*) FROM label_asset a
+                  JOIN label_data_entry en ON en.id = a.entry_id AND en.deleted = 0
+                  WHERE a.project_id = e.project_id AND a.deleted = 0
+                    AND (a.frame_flag IS NULL OR a.frame_flag &lt;&gt; 'invalid')
+                    AND (e.batch_id IS NULL OR en.batch_id = e.batch_id)
+                    AND en.label_status IN ('labeled', 'revised') AND en.review_status = 'passed')
+               ) AS assetCount,
+               e.result_url AS resultUrl,
+               e.error_message AS errorMessage,
+               COALESCE(u.nick_name, u.user_name, '未知') AS createdBy,
+               e.create_time AS createTime
+        FROM label_export_job e
+        JOIN label_project p ON p.id = e.project_id
+        LEFT JOIN label_asset_batch bb ON bb.id = e.batch_id AND bb.deleted = 0
+        LEFT JOIN sys_user u ON u.user_id = e.created_by
+        WHERE e.deleted = 0
+        ORDER BY e.id DESC
+    </select>
+
+    <select id="selectExport" resultType="org.dromara.label.vo.ExportJobVO">
+        SELECT e.id,
+               e.project_id AS projectId,
+               p.project_name AS projectName,
+               e.batch_id AS batchId,
+               COALESCE(bb.batch_name, bb.batch_no) AS batchName,
+               e.export_format AS format,
+               e.status,
+               COALESCE(JSON_UNQUOTE(JSON_EXTRACT(e.param_json, '$.assetCount')), 0) AS assetCount,
+               e.result_url AS resultUrl,
+               e.error_message AS errorMessage,
+               e.param_json AS paramJson,
+               e.create_time AS createTime
+        FROM label_export_job e
+        JOIN label_project p ON p.id = e.project_id
+        LEFT JOIN label_asset_batch bb ON bb.id = e.batch_id AND bb.deleted = 0
+        WHERE e.id = #{id}
+    </select>
+
+    <select id="countAssetsByProject" resultType="long">
+        SELECT COUNT(*) FROM label_asset WHERE project_id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="countProjectById" resultType="int">
+        SELECT COUNT(*) FROM label_project WHERE id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="countBatchInProject" resultType="int">
+        SELECT COUNT(*) FROM label_asset_batch
+        WHERE id = #{batchId} AND project_id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="selectBatchName" resultType="string">
+        SELECT COALESCE(batch_name, batch_no) FROM label_asset_batch
+        WHERE id = #{batchId} AND deleted = 0
+    </select>
+
+    <!-- 批次内未完成条目数：批次内存在未通过全部审核的条目即未完成（0 且有合格资产 = 已完成可导出） -->
+    <select id="countUnfinishedEntries" resultType="long">
+        SELECT COUNT(*)
+        FROM label_data_entry
+        WHERE batch_id = #{batchId} AND deleted = 0
+          AND NOT (label_status IN ('labeled', 'revised') AND review_status = 'passed')
+    </select>
+
+    <!--
+      项目下可导出（已完成）批次：批次内全部数据条目均通过全部审核节点（合格）。
+      HAVING 保证：批次有条目且不存在未合格条目；assetCount 为该批次可导出资产数。
+    -->
+    <select id="selectExportableBatches" resultType="org.dromara.label.vo.ExportBatchVO">
+        SELECT b.id,
+               b.batch_no AS batchNo,
+               COALESCE(b.batch_name, b.batch_no) AS batchName,
+               COUNT(en.id) AS entryCount,
+               (SELECT COUNT(*) FROM label_asset a
+                  JOIN label_data_entry q ON q.id = a.entry_id AND q.deleted = 0
+                 WHERE a.batch_id = b.id AND a.deleted = 0
+                   AND (a.frame_flag IS NULL OR a.frame_flag &lt;&gt; 'invalid')
+                   AND q.label_status IN ('labeled', 'revised') AND q.review_status = 'passed') AS assetCount
+        FROM label_asset_batch b
+        JOIN label_data_entry en ON en.batch_id = b.id AND en.deleted = 0
+        WHERE b.project_id = #{projectId} AND b.deleted = 0
+        GROUP BY b.id, b.batch_no, b.batch_name
+        HAVING COUNT(en.id) &gt; 0
+           AND SUM(CASE WHEN en.label_status IN ('labeled', 'revised') AND en.review_status = 'passed'
+                        THEN 0 ELSE 1 END) = 0
+        ORDER BY b.id DESC
+    </select>
+
+    <select id="selectProjectName" resultType="string">
+        SELECT project_name FROM label_project WHERE id = #{projectId} AND deleted = 0
+    </select>
+
+    <select id="countQualifiedAssetsMulti" resultType="long">
+        SELECT COUNT(*)
+        FROM label_asset a
+        JOIN label_data_entry en ON en.id = a.entry_id AND en.deleted = 0
+        WHERE a.project_id = #{projectId}
+          AND a.deleted = 0
+          <!-- 无效帧不计入可导出资产数（与 selectExportAssets 口径一致） -->
+          AND (a.frame_flag IS NULL OR a.frame_flag &lt;&gt; 'invalid')
+          AND en.batch_id IN
+          <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          AND <include refid="qualifiedEntryFilter"/>
+    </select>
+
+    <select id="countQualifiedAssets" resultType="long">
+        SELECT COUNT(*)
+        FROM label_asset a
+        JOIN label_data_entry en ON en.id = a.entry_id AND en.deleted = 0
+        WHERE a.project_id = #{projectId}
+          AND a.deleted = 0
+          <!-- 无效帧不计入可导出资产数（与 selectExportAssets 口径一致） -->
+          AND (a.frame_flag IS NULL OR a.frame_flag &lt;&gt; 'invalid')
+          <if test="batchId != null">
+              AND en.batch_id = #{batchId}
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+    </select>
+
+    <insert id="insertExportJob" parameterType="map" useGeneratedKeys="true" keyProperty="id" keyColumn="id">
+        INSERT INTO label_export_job (
+            project_id, batch_id, export_format, status, param_json, result_url, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{batchId}, #{format}, #{status}, #{paramJson}, NULL, #{userId}, #{userId}
+        )
+    </insert>
+
+    <insert id="insertDeliveryRecord" parameterType="map">
+        INSERT INTO label_delivery_record (
+            project_id, export_job_id, dataset_version, export_format, asset_count,
+            delivered_by, delivered_time, created_by, updated_by
+        ) VALUES (
+            #{projectId}, #{exportJobId}, #{datasetVersion}, #{format}, #{assetCount},
+            #{userId}, NOW(), #{userId}, #{userId}
+        )
+    </insert>
+
+    <update id="updateExportSuccess">
+        UPDATE label_export_job
+        SET status = 'success',
+            result_url = #{resultUrl},
+            error_message = NULL,
+            param_json = JSON_SET(IFNULL(param_json, JSON_OBJECT()), '$.assetCount', #{assetCount}),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0 AND status = 'processing'
+    </update>
+
+    <update id="updateExportFailed">
+        UPDATE label_export_job
+        SET status = 'failed',
+            error_message = #{errorMessage},
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE id = #{id} AND deleted = 0 AND status = 'processing'
+    </update>
+
+    <update id="updateExportCanceled">
+        UPDATE label_export_job
+        SET status = 'canceled', updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{id} AND status &lt;&gt; 'success'
+    </update>
+
+    <!-- ============ 文本导出（TEXT 格式）：条目（含正文元信息）/ 实体 / 情感 ============ -->
+
+    <!-- 合格文本条目：一个条目一条文本资产（split_mode=whole），正文按 file_url 回读 MinIO -->
+    <select id="selectExportTextEntries" resultType="map">
+        SELECT en.id AS entryId,
+               en.entry_no AS entryNo,
+               en.entry_name AS entryName,
+               asset.id AS assetId,
+               asset.file_name AS fileName,
+               asset.file_url AS fileUrl,
+               JSON_UNQUOTE(JSON_EXTRACT(asset.meta_json, '$')) AS metaJson
+        FROM label_data_entry en
+        JOIN label_asset asset ON asset.entry_id = en.id AND asset.deleted = 0 AND asset.media_type = 'text'
+        WHERE en.project_id = #{projectId}
+          AND en.deleted = 0
+          AND (asset.frame_flag IS NULL OR asset.frame_flag &lt;&gt; 'invalid')
+          <if test="batchIds != null and batchIds.size > 0">
+              AND en.batch_id IN
+              <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY en.id
+    </select>
+
+    <select id="selectExportTextEntities" resultType="map">
+        SELECT a.asset_id AS assetId,
+               te.entity_key AS entityKey,
+               te.class_id AS classId,
+               c.label_name AS className,
+               c.color AS color,
+               te.start_offset AS startOffset,
+               te.end_offset AS endOffset,
+               te.entity_text AS entityText,
+               te.sentence_index AS sentenceIndex
+        FROM label_text_entity te
+        JOIN label_annotation a ON a.id = te.annotation_id AND a.deleted = 0
+        JOIN label_asset asset ON asset.id = a.asset_id AND asset.deleted = 0
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        LEFT JOIN label_text_class c ON c.id = te.class_id AND c.deleted = 0
+        WHERE en.project_id = #{projectId}
+          AND te.deleted = 0
+          <if test="batchIds != null and batchIds.size > 0">
+              AND en.batch_id IN
+              <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY te.id
+    </select>
+
+    <select id="selectExportTextSentiments" resultType="map">
+        SELECT a.asset_id AS assetId,
+               ts.level_type AS levelType,
+               ts.sentence_index AS sentenceIndex,
+               ts.class_id AS classId,
+               c.label_name AS className,
+               c.color AS color,
+               ts.remark AS remark
+        FROM label_text_sentiment ts
+        JOIN label_annotation a ON a.id = ts.annotation_id AND a.deleted = 0
+        JOIN label_asset asset ON asset.id = a.asset_id AND asset.deleted = 0
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        LEFT JOIN label_text_class c ON c.id = ts.class_id AND c.deleted = 0
+        WHERE en.project_id = #{projectId}
+          AND ts.deleted = 0
+          <if test="batchIds != null and batchIds.size > 0">
+              AND en.batch_id IN
+              <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY ts.id
+    </select>
+
+    <select id="selectExportAssets" resultType="org.dromara.label.vo.ExportAssetVO">
+        SELECT asset.id AS assetId,
+               asset.media_type AS mediaType,
+               asset.file_name AS fileName,
+               asset.file_url AS fileUrl,
+               asset.thumbnail_url AS thumbnailUrl,
+               asset.file_size AS fileSize,
+               asset.width AS width,
+               asset.height AS height,
+               asset.upload_id AS uploadId,
+               asset.frame_flag AS frameFlag,
+               asset.invalid_reason AS invalidReason,
+               JSON_UNQUOTE(JSON_EXTRACT(asset.meta_json, '$')) AS metaJson
+        FROM label_asset asset
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        WHERE asset.project_id = #{projectId}
+          AND asset.deleted = 0
+          <!-- 无效帧（frame_flag=invalid）整帧跳过：该帧及其标注都不进导出包 -->
+          AND (asset.frame_flag IS NULL OR asset.frame_flag &lt;&gt; 'invalid')
+          <if test="batchId != null">
+              AND en.batch_id = #{batchId}
+          </if>
+          <if test="batchIds != null and batchIds.size > 0">
+              AND en.batch_id IN
+              <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY asset.id
+    </select>
+
+    <!-- 全部帧状态（含被导出过滤掉的无效帧），仅供平台扩展 sidecar 记录，不改变合格数据导出口径 -->
+    <select id="selectExportFrameMeta" resultType="org.dromara.label.vo.ExportAssetVO">
+        SELECT asset.id AS assetId,
+               asset.upload_id AS uploadId,
+               asset.file_name AS fileName,
+               asset.frame_flag AS frameFlag,
+               asset.invalid_reason AS invalidReason
+        FROM label_asset asset
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        WHERE asset.project_id = #{projectId}
+          AND asset.deleted = 0
+          <if test="batchId != null">
+              AND en.batch_id = #{batchId}
+          </if>
+          <if test="batchIds != null and batchIds.size > 0">
+              AND en.batch_id IN
+              <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY asset.id
+    </select>
+
+    <select id="selectExportAnnotations" resultType="org.dromara.label.vo.ExportAnnotationVO">
+        SELECT j.id AS jobId,
+               j.job_no AS jobNo,
+               j.data_type AS mediaType,
+               asset.id AS assetId,
+               asset.file_name AS fileName,
+               a.id AS annotationId,
+               a.version,
+               a.status AS annotationStatus,
+               ao.object_key AS objectKey,
+               ao.object_type AS objectType,
+               ao.class_id AS classId,
+               c.label_name AS className,
+               c.color,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$')) AS geometryJson,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.attr_json, '$')) AS attrJson
+        FROM label_annotation a
+        JOIN label_job j ON j.id = a.job_id AND j.deleted = 0
+        JOIN label_asset asset ON asset.id = a.asset_id AND asset.deleted = 0
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+        LEFT JOIN label_class c ON c.id = ao.class_id
+        WHERE asset.project_id = #{projectId}
+          AND a.deleted = 0
+          <!-- 无效帧上的标注一并跳过 -->
+          AND (asset.frame_flag IS NULL OR asset.frame_flag &lt;&gt; 'invalid')
+          <if test="batchId != null">
+              AND en.batch_id = #{batchId}
+          </if>
+          <if test="batchIds != null and batchIds.size > 0">
+              AND en.batch_id IN
+              <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          </if>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY asset.id, j.id, ao.id
+    </select>
+
+    <select id="selectExportAssetsMulti" resultType="org.dromara.label.vo.ExportAssetVO">
+        SELECT asset.id AS assetId,
+               asset.media_type AS mediaType,
+               asset.file_name AS fileName,
+               asset.file_url AS fileUrl,
+               asset.thumbnail_url AS thumbnailUrl,
+               asset.file_size AS fileSize,
+               asset.width AS width,
+               asset.height AS height,
+               asset.upload_id AS uploadId,
+               asset.frame_flag AS frameFlag,
+               asset.invalid_reason AS invalidReason,
+               JSON_UNQUOTE(JSON_EXTRACT(asset.meta_json, '$')) AS metaJson
+        FROM label_asset asset
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        WHERE asset.project_id = #{projectId}
+          AND asset.deleted = 0
+          <!-- 无效帧整帧跳过：该帧及其标注都不进导出包 -->
+          AND (asset.frame_flag IS NULL OR asset.frame_flag &lt;&gt; 'invalid')
+          AND en.batch_id IN
+          <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY asset.id
+    </select>
+
+    <select id="selectExportAnnotationsMulti" resultType="org.dromara.label.vo.ExportAnnotationVO">
+        SELECT j.id AS jobId,
+               j.job_no AS jobNo,
+               j.data_type AS mediaType,
+               asset.id AS assetId,
+               asset.file_name AS fileName,
+               a.id AS annotationId,
+               a.version,
+               a.status AS annotationStatus,
+               ao.object_key AS objectKey,
+               ao.object_type AS objectType,
+               ao.class_id AS classId,
+               c.label_name AS className,
+               c.color,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.geometry_json, '$')) AS geometryJson,
+               JSON_UNQUOTE(JSON_EXTRACT(ao.attr_json, '$')) AS attrJson
+        FROM label_annotation a
+        JOIN label_job j ON j.id = a.job_id AND j.deleted = 0
+        JOIN label_asset asset ON asset.id = a.asset_id AND asset.deleted = 0
+        JOIN label_data_entry en ON en.id = asset.entry_id AND en.deleted = 0
+        JOIN label_annotation_object ao ON ao.annotation_id = a.id AND ao.deleted = 0
+        LEFT JOIN label_class c ON c.id = ao.class_id
+        WHERE asset.project_id = #{projectId}
+          AND a.deleted = 0
+          <!-- 无效帧上的标注一并跳过 -->
+          AND (asset.frame_flag IS NULL OR asset.frame_flag &lt;&gt; 'invalid')
+          AND en.batch_id IN
+          <foreach collection="batchIds" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+          AND <include refid="qualifiedEntryFilter"/>
+        ORDER BY asset.id, j.id, ao.id
+    </select>
+
+    <select id="selectDeliveryRecords" resultType="org.dromara.label.vo.DeliveryRecordVO">
+        SELECT dr.id,
+               p.project_name AS projectName,
+               dr.export_job_id AS exportJobId,
+               dr.dataset_version AS datasetVersion,
+               dr.export_format AS format,
+               dr.asset_count AS assetCount,
+               COALESCE(u.nick_name, u.user_name, '未知') AS deliveredBy,
+               dr.delivered_time AS deliveredTime
+        FROM label_delivery_record dr
+        JOIN label_project p ON p.id = dr.project_id
+        LEFT JOIN sys_user u ON u.user_id = dr.delivered_by
+        WHERE dr.deleted = 0
+        ORDER BY dr.id DESC
+    </select>
+</mapper>

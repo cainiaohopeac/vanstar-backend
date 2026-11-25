@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="org.dromara.label.mapper.ReviewMapper">
+
+    <select id="selectJobTaskId" resultType="long">
+        SELECT task_id FROM label_job WHERE id = #{jobId}
+    </select>
+
+    <select id="selectLatestAnnotationIdByJob" resultType="long">
+        SELECT id FROM label_annotation
+        WHERE job_id = #{jobId}
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <update id="updateJobRejected">
+        UPDATE label_job
+        SET status = 'review_rejected', reject_count = reject_count + 1,
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{jobId}
+    </update>
+
+    <update id="updateJobReviewState">
+        UPDATE label_job
+        SET status = #{status}, qc_status = #{qcStatus}, progress = 100,
+            updated_by = #{userId}, update_time = NOW()
+        WHERE id = #{jobId}
+    </update>
+
+    <insert id="insertReviewRecord" parameterType="map">
+        INSERT INTO label_review_record (
+            job_id, asset_id, entry_id, annotation_id, reviewer_id, review_type, result, comment,
+            created_by, updated_by
+        ) VALUES (
+            #{jobId}, #{assetId}, #{entryId}, #{annotationId}, #{reviewerId}, #{reviewType}, #{result}, #{comment},
+            #{userId}, #{userId}
+        )
+    </insert>
+
+    <!--
+        单个数据资产的审核上下文：审核员修订模式（editMode=reviewer）的鉴权依据。
+        仅按 label_asset.id 主键查询，无额外索引开销。
+    -->
+    <select id="selectAssetReviewContext" resultType="org.dromara.label.dto.AssetReviewContextDTO">
+        SELECT a.id            AS assetId,
+               a.review_status AS reviewStatus,
+               a.reviewer_id   AS reviewerId,
+               a.entry_id      AS entryId
+        FROM label_asset a
+        WHERE a.id = #{assetId} AND a.deleted = 0
+    </select>
+
+    <update id="updateTaskCompletedCountByJob">
+        UPDATE label_task t
+        JOIN label_job j ON j.task_id = t.id
+        SET t.completed_count = LEAST(t.asset_count, t.completed_count + j.asset_count),
+            t.update_time = NOW()
+        WHERE j.id = #{jobId}
+    </update>
+
+    <update id="updateAssetsReviewByJob">
+        UPDATE label_asset a
+        JOIN label_job_asset ja ON ja.asset_id = a.id
+        SET a.review_status = #{reviewStatus},
+            <if test="labelStatus != null">
+            a.label_status = #{labelStatus},
+            </if>
+            a.reviewer_id = #{reviewerId},
+            a.reject_count = CASE WHEN #{incrementReject} THEN a.reject_count + 1 ELSE a.reject_count END,
+            a.review_time = NOW(),
+            a.updated_by = #{userId},
+            a.update_time = NOW()
+        WHERE ja.job_id = #{jobId} AND a.deleted = 0
+    </update>
+
+    <select id="selectReviewRecords" resultType="org.dromara.label.vo.ReviewRecordVO">
+        SELECT rr.id,
+               rr.job_id AS jobId,
+               COALESCE(u.nick_name, u.user_name, '未知') AS reviewerName,
+               rr.review_type AS reviewType,
+               rr.result,
+               rr.problem_type AS problemType,
+               rr.problem_level AS problemLevel,
+               rr.comment,
+               rr.create_time AS createTime
+        FROM label_review_record rr
+        LEFT JOIN sys_user u ON u.user_id = rr.reviewer_id
+        WHERE rr.deleted = 0 AND rr.job_id = #{jobId}
+        ORDER BY rr.id DESC
+    </select>
+
+    <!-- ==================== 条目级审核（审核状态维度，条目 = 数据集合包） ==================== -->
+
+    <sql id="reviewEntryColumns">
+        e.id,
+        e.entry_no AS entryNo,
+        e.entry_name AS entryName,
+        e.entry_name AS fileName,
+        e.asset_count AS assetCount,
+        fa.file_url AS fileUrl,
+        fa.thumbnail_url AS thumbnailUrl,
+        e.task_id AS taskId,
+        t.task_no AS taskNo,
+        t.task_name AS taskName,
+        e.batch_id AS batchId,
+        COALESCE(b.batch_name, b.batch_no) AS batchName,
+        e.media_type AS mediaType,
+        e.label_status AS labelStatus,
+        e.review_status AS reviewStatus,
+        e.review_round AS reviewRound,
+        e.reject_count AS rejectCount,
+        e.assignee_id AS assigneeId,
+        COALESCE(sa.nick_name, sa.user_name) AS assigneeName,
+        e.reviewer_id AS reviewerId,
+        COALESCE(sr.nick_name, sr.user_name) AS reviewerName,
+        e.assign_time AS assignTime,
+        e.review_time AS reviewTime,
+        e.update_time AS updateTime,
+        <!-- 承载该条目数据的作业（与审核提交取作业口径一致），供「审核 / 查看」直接打开标注工作台 -->
+        (SELECT ja.job_id FROM label_job_asset ja
+          JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+          WHERE a.entry_id = e.id ORDER BY ja.job_id DESC LIMIT 1) AS jobId
+    </sql>
+
+    <sql id="reviewEntryFrom">
+        FROM label_data_entry e
+        LEFT JOIN label_task t ON t.id = e.task_id
+        LEFT JOIN label_asset_batch b ON b.id = e.batch_id
+        LEFT JOIN sys_user sa ON sa.user_id = e.assignee_id
+        LEFT JOIN sys_user sr ON sr.user_id = e.reviewer_id
+        <!-- 首个资产：fileUrl/thumbnailUrl 走 first_asset_id 主键 JOIN（一对零/一，不改变 countReviewEntries 计数） -->
+        LEFT JOIN label_asset fa ON fa.id = e.first_asset_id AND fa.deleted = 0
+    </sql>
+
+    <sql id="reviewEntryFilters">
+        e.deleted = 0
+        <if test="taskId != null">
+            AND e.task_id = #{taskId}
+        </if>
+        <if test="status != null and status != ''">
+            <choose>
+                <!-- 待领取：已标注/已修订且未审核 -->
+                <when test="status == 'pending'">
+                    AND e.review_status = 'none' AND e.label_status IN ('labeled', 'revised')
+                </when>
+                <when test="status == 'reviewing'">AND e.review_status = 'reviewing'</when>
+                <when test="status == 're_reviewing'">AND e.review_status = 're_reviewing'</when>
+                <when test="status == 'passed'">AND e.review_status = 'passed'</when>
+                <when test="status == 'rejected'">AND e.review_status IN ('rejected', 're_rejected')</when>
+                <!-- 我的审核：当前审核人正在审核的条目 -->
+                <when test="status == 'mine'">
+                    AND e.reviewer_id = #{userId} AND e.review_status IN ('reviewing', 're_reviewing')
+                </when>
+            </choose>
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND (t.task_no LIKE CONCAT('%', #{keyword}, '%')
+                 OR t.task_name LIKE CONCAT('%', #{keyword}, '%')
+                 OR e.entry_name LIKE CONCAT('%', #{keyword}, '%')
+                 OR e.entry_no LIKE CONCAT('%', #{keyword}, '%')
+                 OR b.batch_name LIKE CONCAT('%', #{keyword}, '%'))
+        </if>
+    </sql>
+
+    <select id="selectReviewEntries" resultType="org.dromara.label.vo.ReviewEntryVO">
+        SELECT <include refid="reviewEntryColumns"/>
+        <include refid="reviewEntryFrom"/>
+        WHERE <include refid="reviewEntryFilters"/>
+        ORDER BY e.review_time DESC, e.id DESC
+        LIMIT #{offset}, #{limit}
+    </select>
+
+    <select id="countReviewEntries" resultType="long">
+        SELECT COUNT(*)
+        <include refid="reviewEntryFrom"/>
+        WHERE <include refid="reviewEntryFilters"/>
+    </select>
+
+    <select id="selectEntryReviewTargets" resultType="org.dromara.label.dto.EntryReviewTargetDTO">
+        SELECT e.id AS entryId,
+               e.entry_name AS entryName,
+               e.task_id AS taskId,
+               e.label_status AS labelStatus,
+               e.review_status AS reviewStatus,
+               e.assignee_id AS assigneeId,
+               e.reviewer_id AS reviewerId,
+               (SELECT ja.job_id FROM label_job_asset ja
+                 JOIN label_asset a ON a.id = ja.asset_id AND a.deleted = 0
+                 WHERE a.entry_id = e.id ORDER BY ja.job_id DESC LIMIT 1) AS jobId
+        FROM label_data_entry e
+        WHERE e.deleted = 0 AND e.id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </select>
+
+    <!-- 领取审核：已标注→审核中，已修订→复审中；轮次+1 -->
+    <update id="updateEntryReviewClaim">
+        UPDATE label_data_entry
+        SET review_status = CASE WHEN label_status = 'revised' THEN 're_reviewing' ELSE 'reviewing' END,
+            reviewer_id = #{userId},
+            review_round = review_round + 1,
+            review_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND review_status = 'none'
+          AND label_status IN ('labeled', 'revised')
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 释放审核领取：本人持有的审核中/复审中条目回到未审核，供其他审核员重新领取 -->
+    <update id="releaseEntryReviewClaim">
+        UPDATE label_data_entry
+        SET review_status = 'none',
+            reviewer_id = NULL,
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND reviewer_id = #{userId}
+          AND review_status IN ('reviewing', 're_reviewing')
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 审核通过：标注状态保持不变，仅审核状态置为已通过 -->
+    <update id="updateEntryReviewApprove">
+        UPDATE label_data_entry
+        SET review_status = 'passed',
+            reviewer_id = #{userId},
+            review_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND review_status IN ('reviewing', 're_reviewing')
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 审核驳回：标注状态回到未修订等待领取修订；复审驳回记为 re_rejected -->
+    <update id="updateEntryReviewReject">
+        UPDATE label_data_entry
+        SET review_status = CASE WHEN review_status = 're_reviewing' THEN 're_rejected' ELSE 'rejected' END,
+            label_status = 'unrevised',
+            reviewer_id = #{userId},
+            reject_count = reject_count + 1,
+            review_time = NOW(),
+            updated_by = #{userId},
+            update_time = NOW()
+        WHERE deleted = 0
+          AND review_status IN ('reviewing', 're_reviewing')
+          AND id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 条目级审核流转后，把条目的审核状态同步到包内全部数据资产（工作台按数据资产展示） -->
+    <update id="syncAssetsFromEntries">
+        UPDATE label_asset a
+        JOIN label_data_entry e ON e.id = a.entry_id
+        SET a.review_status = e.review_status,
+            a.label_status = e.label_status,
+            a.review_round = e.review_round,
+            a.reject_count = e.reject_count,
+            a.reviewer_id = e.reviewer_id,
+            a.assignee_id = e.assignee_id,
+            a.review_time = e.review_time,
+            a.update_time = NOW()
+        WHERE a.deleted = 0 AND e.deleted = 0 AND e.id IN
+        <foreach collection="assetIds" item="entryId" open="(" separator="," close=")">
+            #{entryId}
+        </foreach>
+    </update>
+
+    <!-- 作业级审核/验收后，把审核结果回刷到作业内数据资产所属的条目（数据集合包） -->
+    <update id="syncEntriesFromAssetsByJob">
+        UPDATE label_data_entry e
+        JOIN (SELECT a.entry_id AS entryId,
+                     COUNT(DISTINCT a.review_status) AS reviewKinds,
+                     MIN(a.review_status) AS reviewValue,
+                     COUNT(DISTINCT a.label_status) AS labelKinds,
+                     MIN(a.label_status) AS labelValue,
+                     MAX(a.reject_count) AS rejectValue,
+                     MAX(a.review_round) AS roundValue,
+                     MIN(a.reviewer_id) AS reviewerValue,
+                     MAX(a.review_time) AS reviewTimeValue
+              FROM label_asset a
+              JOIN label_job_asset ja ON ja.asset_id = a.id
+              WHERE ja.job_id = #{jobId} AND a.deleted = 0 AND a.entry_id IS NOT NULL
+              GROUP BY a.entry_id) s ON s.entryId = e.id
+        SET e.review_status = CASE WHEN s.reviewKinds = 1 THEN s.reviewValue ELSE e.review_status END,
+            e.label_status = CASE WHEN s.labelKinds = 1 THEN s.labelValue ELSE e.label_status END,
+            e.reject_count = IFNULL(s.rejectValue, e.reject_count),
+            e.review_round = GREATEST(IFNULL(s.roundValue, 0), IFNULL(e.review_round, 0)),
+            e.reviewer_id = s.reviewerValue,
+            e.review_time = s.reviewTimeValue,
+            e.updated_by = #{userId},
+            e.update_time = NOW()
+        WHERE e.deleted = 0
+    </update>
+
+    <select id="selectReviewRecordsByAsset" resultType="org.dromara.label.vo.ReviewRecordVO">
+        SELECT rr.id,
+               rr.job_id AS jobId,
+               COALESCE(u.nick_name, u.user_name, '未知') AS reviewerName,
+               rr.review_type AS reviewType,
+               rr.result,
+               rr.problem_type AS problemType,
+               rr.problem_level AS problemLevel,
+               rr.comment,
+               rr.create_time AS createTime
+        FROM label_review_record rr
+        LEFT JOIN sys_user u ON u.user_id = rr.reviewer_id
+        WHERE rr.deleted = 0
+          AND (rr.entry_id = #{assetId} OR rr.asset_id = #{assetId})
+        ORDER BY rr.id DESC
+    </select>
+</mapper>
